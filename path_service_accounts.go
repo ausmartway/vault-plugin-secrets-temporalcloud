@@ -229,10 +229,11 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 		NamespaceAccess: namespaceAccess,
 	}
 
-	c, err := b.getClient(ctx, req.Storage)
+	c, release, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	switch {
 	case existing == nil:
@@ -258,21 +259,23 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 			entry.Adopted = true
 
 			if err := c.UpdateServiceAccount(ctx, found.ID, spec); err != nil {
-				return nil, fmt.Errorf("adopting service account %q: %w", name, err)
+				return respondCloudErr(fmt.Sprintf("adopting service account %q", name), err)
 			}
 
 		case errors.Is(err, client.ErrNotFound):
 			// The name is free — create it, which is the ordinary path.
 			id, err := c.CreateServiceAccount(ctx, spec)
 			if err != nil {
-				return nil, fmt.Errorf("creating service account %q in Temporal Cloud: %w", name, err)
+				return respondCloudErr(
+					fmt.Sprintf("creating service account %q in Temporal Cloud", name), err)
 			}
 			entry.ServiceAccountID = id
 
 		default:
 			// Any other lookup failure must not fall through to creating a
 			// duplicate — we simply do not know whether the name is free.
-			return nil, fmt.Errorf("checking whether service account %q already exists: %w", name, err)
+			return respondCloudErr(
+				fmt.Sprintf("checking whether service account %q already exists", name), err)
 		}
 
 	default:
@@ -282,7 +285,8 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 		// are a Vault-side concern, so a TTL-only edit needs no API call.
 		if cloudSpecChanged(existing, entry) {
 			if err := c.UpdateServiceAccount(ctx, entry.ServiceAccountID, spec); err != nil {
-				return nil, fmt.Errorf("updating service account %q in Temporal Cloud: %w", name, err)
+				return respondCloudErr(
+					fmt.Sprintf("updating service account %q in Temporal Cloud", name), err)
 			}
 		}
 	}
@@ -371,16 +375,18 @@ func (b *backend) pathServiceAccountDelete(ctx context.Context, req *logical.Req
 		return nil, nil
 	}
 
-	c, err := b.getClient(ctx, req.Storage)
+	c, release, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	resp := &logical.Response{}
 
 	if err := c.DeleteServiceAccount(ctx, entry.ServiceAccountID); err != nil {
 		if !errors.Is(err, client.ErrNotFound) {
-			return nil, fmt.Errorf("deleting service account %q from Temporal Cloud: %w", name, err)
+			return respondCloudErr(
+				fmt.Sprintf("deleting service account %q from Temporal Cloud", name), err)
 		}
 		// Already gone in Temporal Cloud — someone deleted it out of band.
 		// Removing the Vault entry is still the right outcome.
@@ -469,6 +475,17 @@ policy for API keys issued from it.
 Creating requires the full spec: account_role, and optionally namespace_access,
 description, ttl, and max_ttl. Deleting it deletes the service account, which
 invalidates every API key it owns.
+
+Revoke the outstanding leases before deleting an entry:
+
+    vault lease revoke -prefix <mount>/creds/<name>
+    vault delete <mount>/service-accounts/<name>
+
+Deleting the entry removes the service account in Temporal Cloud while leases
+still reference the API keys it owned. Those leases can still be revoked
+afterwards — revocation treats an already-absent key as success — but that
+path has never been exercised against a live account, so revoking first keeps
+the teardown on the behaviour that has.
 
 Temporal Cloud requires service-account names to be unique across all active
 service accounts. Creating a name already in use there fails, naming the

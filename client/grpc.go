@@ -10,8 +10,6 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Config already exists in client.go from Task 1 — do not redeclare it here.
-
 // grpcClient implements CloudOps against the real Cloud Ops API.
 type grpcClient struct {
 	conn *cloudclient.Client
@@ -160,7 +158,7 @@ func (c *grpcClient) CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey
 //
 // That earlier version omitted ResourceVersion on the theory that KeyId
 // alone already identifies exactly one key, so a version couldn't be needed
-// to target the right one. Live testing during Task 8 disproved that: the
+// to target the right one. Live testing disproved that: the
 // Cloud Ops API rejects DeleteApiKey outright when ResourceVersion is empty,
 // with "invalid argument: invalid resource version" — the field is
 // mandatory, not merely an optional optimistic-concurrency check. So a

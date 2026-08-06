@@ -66,10 +66,11 @@ func (b *backend) secretAPIKeyRevoke(ctx context.Context, req *logical.Request, 
 		return nil, err
 	}
 
-	c, err := b.getClient(ctx, req.Storage)
+	c, release, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	if err := c.DeleteAPIKey(ctx, keyID); err != nil {
 		// The key being gone is the outcome we wanted. It may have expired on

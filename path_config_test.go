@@ -301,6 +301,47 @@ func TestConfig_RejectsRootKeyTTLOverTwoYears(t *testing.T) {
 	}
 }
 
+// Temporal Cloud also enforces an undocumented 24-hour minimum expiry, so a
+// root_key_ttl below it must be refused here. Accepting it would leave
+// rotate-root failing later with Temporal Cloud's own raw message, and the
+// operator with no idea the value they set was the cause.
+func TestConfig_RejectsRootKeyTTLUnderTheMinimum(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"api_key":                  "tmprl_sk_test",
+			"admin_service_account_id": "sa-123",
+			"root_key_ttl":             "1h", // the "let me demo rotation quickly" value
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected an error response, not a 500: %v", err)
+	}
+	if resp == nil || !resp.IsError() {
+		t.Fatal("expected root_key_ttl under 24h to be rejected")
+	}
+
+	// The message must name the minimum, or the operator has to guess what
+	// value would be accepted.
+	msg := resp.Error().Error()
+	if !strings.Contains(msg, client.MinAPIKeyExpiry.String()) {
+		t.Errorf("expected the error to name the %s minimum, got: %s", client.MinAPIKeyExpiry, msg)
+	}
+
+	entry, err := storage.Get(context.Background(), configStoragePath)
+	if err != nil {
+		t.Fatalf("storage get: %v", err)
+	}
+	if entry != nil {
+		t.Fatal("config must not be persisted when root_key_ttl is rejected")
+	}
+}
+
 func TestConfig_Delete(t *testing.T) {
 	b, storage := newTestBackend(t)
 	withStubClient(b, &stubCloudOps{})

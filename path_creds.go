@@ -43,16 +43,21 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 				"'vault write %sservice-accounts/%s ...'", name, req.MountPoint, name), nil
 	}
 
-	c, err := b.getClient(ctx, req.Storage)
+	c, release, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	// Check the ceiling before minting, so the operator gets an explanation
-	// rather than a raw ResourceExhausted from Temporal Cloud.
+	// rather than a raw ResourceExhausted from Temporal Cloud. This is a
+	// nicer-error fast path, not enforcement: Temporal Cloud is the real
+	// enforcer, and concurrent reads that all see count=19 can still race past
+	// this check, in which case the losers get Temporal Cloud's own quota
+	// error instead of the message below.
 	count, err := c.CountAPIKeys(ctx, entry.ServiceAccountID)
 	if err != nil {
-		return nil, fmt.Errorf("counting existing API keys for %q: %w", name, err)
+		return respondCloudErr(fmt.Sprintf("counting existing API keys for %q", name), err)
 	}
 	if err := checkAPIKeyCapacity(name, count, entry.TTL); err != nil {
 		return logical.ErrorResponse(err.Error()), nil
@@ -88,7 +93,7 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 		ExpiryTime:       expiry,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("minting an API key for %q: %w", name, err)
+		return respondCloudErr(fmt.Sprintf("minting an API key for %q", name), err)
 	}
 
 	resp := b.Secret(secretTypeAPIKey).Response(

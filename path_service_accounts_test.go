@@ -417,7 +417,7 @@ func TestServiceAccounts_NoCollisionForceStillCreates(t *testing.T) {
 }
 
 // force is ignored on update: an entry Vault already manages takes the
-// ordinary merge path from Task 6, and no name lookup happens because the
+// ordinary merge path, and no name lookup happens because the
 // binding already exists.
 func TestServiceAccounts_ForceIgnoredOnUpdate(t *testing.T) {
 	b, storage := newTestBackend(t)

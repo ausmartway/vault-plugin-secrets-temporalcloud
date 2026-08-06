@@ -67,7 +67,7 @@ func withCountingClient(b *backend) (calls *int32, clients *[]*countingClient) {
 func TestGetClient_Unconfigured(t *testing.T) {
 	b, storage := newTestBackend(t)
 
-	_, err := b.getClient(context.Background(), storage)
+	_, _, err := b.getClient(context.Background(), storage)
 	if err != errBackendNotConfigured {
 		t.Fatalf("expected errBackendNotConfigured, got %v", err)
 	}
@@ -85,14 +85,16 @@ func TestGetClient_CachesAcrossCalls(t *testing.T) {
 	// made by getClient itself are under test here.
 	atomic.StoreInt32(calls, 0)
 
-	c1, err := b.getClient(context.Background(), storage)
+	c1, release1, err := b.getClient(context.Background(), storage)
 	if err != nil {
 		t.Fatalf("first getClient: %v", err)
 	}
-	c2, err := b.getClient(context.Background(), storage)
+	defer release1()
+	c2, release2, err := b.getClient(context.Background(), storage)
 	if err != nil {
 		t.Fatalf("second getClient: %v", err)
 	}
+	defer release2()
 
 	if c1 != c2 {
 		t.Fatal("expected getClient to return the same cached instance")
@@ -116,19 +118,21 @@ func TestGetClient_InvalidationBuildsFreshClientAndClosesOld(t *testing.T) {
 	atomic.StoreInt32(calls, 0)
 	*clients = nil
 
-	c1, err := b.getClient(context.Background(), storage)
+	c1, release1, err := b.getClient(context.Background(), storage)
 	if err != nil {
 		t.Fatalf("first getClient: %v", err)
 	}
+	release1()
 
 	// Explicit invalidation, as Vault performs on config change / unmount /
 	// seal, without requiring a second config write.
 	b.resetClient()
 
-	c2, err := b.getClient(context.Background(), storage)
+	c2, release2, err := b.getClient(context.Background(), storage)
 	if err != nil {
 		t.Fatalf("getClient after reset: %v", err)
 	}
+	defer release2()
 
 	if got := atomic.LoadInt32(calls); got != 2 {
 		t.Fatalf("expected newClient to be called twice after invalidation, got %d", got)
@@ -140,6 +144,41 @@ func TestGetClient_InvalidationBuildsFreshClientAndClosesOld(t *testing.T) {
 	old := (*clients)[0].stubCloudOps
 	if !old.closed {
 		t.Fatal("expected the old client to have Close() called on invalidation")
+	}
+}
+
+// (e) In-flight safety: invalidating while a request still holds the client
+// must not close the connection underneath it. Closing early is silent —
+// the request fails mid-operation, and for a creds/ read that means an API
+// key minted in Temporal Cloud with no Vault lease to revoke it.
+func TestGetClient_InvalidationWaitsForInFlightUsers(t *testing.T) {
+	b, storage := newTestBackend(t)
+	_, clients := withCountingClient(b)
+	mustWriteConfig(t, b, storage)
+	*clients = nil
+
+	c, release, err := b.getClient(context.Background(), storage)
+	if err != nil {
+		t.Fatalf("getClient: %v", err)
+	}
+	inFlight := (*clients)[0].stubCloudOps
+
+	// Invalidation arrives while the request above is still using the client.
+	b.resetClient()
+
+	if inFlight.closed {
+		t.Fatal("the client was closed while a request still held it")
+	}
+
+	// It must still work, which is the whole point of holding it open.
+	if _, err := c.GetServiceAccount(context.Background(), "sa-123"); err != nil {
+		t.Fatalf("expected the retired client to stay usable in flight: %v", err)
+	}
+
+	// The last release is what closes it.
+	release()
+	if !inFlight.closed {
+		t.Fatal("expected the retired client to be closed once its last user released it")
 	}
 }
 
@@ -158,6 +197,7 @@ func TestGetClient_ConcurrentCallsBuildOnce(t *testing.T) {
 
 	const n = 50
 	results := make([]client.CloudOps, n)
+	releases := make([]func(), n)
 	errs := make([]error, n)
 
 	var wg sync.WaitGroup
@@ -165,10 +205,16 @@ func TestGetClient_ConcurrentCallsBuildOnce(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			results[i], errs[i] = b.getClient(context.Background(), storage)
+			results[i], releases[i], errs[i] = b.getClient(context.Background(), storage)
 		}(i)
 	}
 	wg.Wait()
+
+	for _, release := range releases {
+		if release != nil {
+			release()
+		}
+	}
 
 	if got := atomic.LoadInt32(calls); got != 1 {
 		t.Fatalf("expected newClient to be called exactly once under concurrency, got %d", got)

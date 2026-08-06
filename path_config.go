@@ -72,7 +72,7 @@ func (b *backend) pathConfig() *framework.Path {
 			"root_key_ttl": {
 				Type:        framework.TypeDurationSecond,
 				Default:     int(defaultRootKeyTTL.Seconds()),
-				Description: "Expiry applied to root API keys minted by rotate-root. Maximum two years.",
+				Description: "Expiry applied to root API keys minted by rotate-root. Minimum 24 hours, maximum two years.",
 			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
@@ -117,6 +117,20 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 			"root_key_ttl of %s exceeds Temporal Cloud's maximum API key expiry of %s",
 			rootKeyTTL, client.MaxAPIKeyExpiry), nil
 	}
+	// Rejected rather than floored, unlike the expiry on a minted credential
+	// (see path_creds.go). root_key_ttl is a number the operator chose
+	// deliberately and will plan the next rotation around, so silently
+	// substituting a different one would mislead them; a short root_key_ttl
+	// set to demo rotation quickly is exactly the case where they need to
+	// hear that the value cannot be honoured, here rather than from a failed
+	// rotate-root later.
+	if rootKeyTTL < client.MinAPIKeyExpiry {
+		return logical.ErrorResponse(
+			"root_key_ttl of %s is below Temporal Cloud's minimum API key expiry of %s. "+
+				"Temporal Cloud does not document this minimum, but it rejects any key "+
+				"expiring sooner, so rotate-root could not honour this value",
+			rootKeyTTL, client.MinAPIKeyExpiry), nil
+	}
 
 	cfg := &config{
 		APIKey:                apiKey,
@@ -153,7 +167,11 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 				"the supplied api_key was rejected, or its service account lacks "+
 					"permission to read %q: %s", adminSAID, err), nil
 		default:
-			return nil, fmt.Errorf("validating the Temporal Cloud credential: %w", err)
+			// Everything the two branches above do not name — a malformed
+			// request, a quota, or a genuine outage — gets the engine's
+			// standard treatment: actionable problems become an error
+			// response, infrastructure failures a 500.
+			return respondCloudErr("validating the Temporal Cloud credential", err)
 		}
 	}
 

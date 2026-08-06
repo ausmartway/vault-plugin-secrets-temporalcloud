@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +68,22 @@ func liveBackend(t *testing.T) (*backend, logical.Storage) {
 	t.Cleanup(func() { b.resetClient() })
 
 	return b, storage
+}
+
+// responseFields lists the field names in a response, sorted, so a failing
+// assertion can say what came back without printing the values. Credential
+// responses carry a live Temporal Cloud API token, which must never reach
+// test output.
+func responseFields(resp *logical.Response) []string {
+	if resp == nil {
+		return nil
+	}
+	fields := make([]string, 0, len(resp.Data))
+	for name := range resp.Data {
+		fields = append(fields, name)
+	}
+	sort.Strings(fields)
+	return fields
 }
 
 // acctestName produces a unique, identifiable resource name.
@@ -176,10 +193,11 @@ func TestLive_ServiceAccountLifecycle(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 
-	c, err := b.getClient(context.Background(), storage)
+	c, releaseClient, err := b.getClient(context.Background(), storage)
 	if err != nil {
 		t.Fatalf("get client: %v", err)
 	}
+	t.Cleanup(releaseClient)
 	sa, err := c.GetServiceAccount(context.Background(), saID)
 	if err != nil {
 		t.Fatalf("fetching the updated service account: %v", err)
@@ -221,15 +239,19 @@ func TestLive_CredentialLifecycle(t *testing.T) {
 	token, _ := resp.Data["api_key"].(string)
 	keyID, _ := resp.Data["api_key_id"].(string)
 	if token == "" || keyID == "" {
-		t.Fatalf("expected a token and key ID, got %v", resp.Data)
+		// Never print resp.Data: it holds a live Temporal Cloud API token, and
+		// test output ends up in CI logs. The field names are enough to see
+		// what the response was missing.
+		t.Fatalf("expected a token and key ID, got fields %v", responseFields(resp))
 	}
 
 	// Clean up the key even if the assertions below fail.
 	t.Cleanup(func() {
-		c, err := b.getClient(context.Background(), storage)
+		c, release, err := b.getClient(context.Background(), storage)
 		if err != nil {
 			return
 		}
+		defer release()
 		_ = c.DeleteAPIKey(context.Background(), keyID)
 	})
 
@@ -327,10 +349,11 @@ func TestLive_RotateRoot(t *testing.T) {
 	}
 
 	// The new key must work.
-	c, err := b.getClient(context.Background(), storage)
+	c, releaseClient, err := b.getClient(context.Background(), storage)
 	if err != nil {
 		t.Fatalf("get client: %v", err)
 	}
+	t.Cleanup(releaseClient)
 	if _, err := c.GetServiceAccount(context.Background(), after.AdminServiceAccountID); err != nil {
 		t.Fatalf("the rotated root key does not work: %v", err)
 	}
@@ -367,10 +390,11 @@ func TestLive_KeyCapacity(t *testing.T) {
 
 		keyID, _ := resp.Data["api_key_id"].(string)
 		t.Cleanup(func() {
-			c, err := b.getClient(context.Background(), storage)
+			c, release, err := b.getClient(context.Background(), storage)
 			if err != nil {
 				return
 			}
+			defer release()
 			_ = c.DeleteAPIKey(context.Background(), keyID)
 		})
 	}
@@ -382,6 +406,12 @@ func TestLive_KeyCapacity(t *testing.T) {
 	})
 	if err == nil && (resp == nil || !resp.IsError()) {
 		t.Fatal("expected the 21st mint to be refused")
+	}
+	// A refusal that arrives as a Go error rather than an error response has
+	// no resp to inspect — assert on it and move on, rather than dereferencing
+	// nil.
+	if resp == nil || !resp.IsError() {
+		t.Fatalf("expected the ceiling to be reported as an error response, got err=%v", err)
 	}
 	if !strings.Contains(resp.Error().Error(), "20 of 20") {
 		t.Errorf("expected our capacity message, got: %v", resp.Error())
@@ -397,7 +427,7 @@ func TestLive_KeyCapacity(t *testing.T) {
 // deleted — by minting a short-lived key and waiting for it to expire. That
 // is no longer possible to test in seconds: Temporal Cloud rejects any
 // expiry less than 24 hours from now (see client.MinAPIKeyExpiry),
-// undocumented, discovered by this project's own task-7 mint failures. That
+// undocumented, discovered by this project's own live mint failures. That
 // question is instead settled by reasoning in the CountAPIKeys comment: an
 // unfiltered count can only overcount if expired-but-undeleted keys are
 // returned, and overcounting just fails a mint early against our own
@@ -426,16 +456,18 @@ func TestLive_CountDisabledKey(t *testing.T) {
 	keyID, _ := resp.Data["api_key_id"].(string)
 	saID, _ := resp.Data["service_account_id"].(string)
 	if keyID == "" || saID == "" {
-		t.Fatalf("expected a key ID and service account ID, got %v", resp.Data)
+		// resp.Data holds a live API token; print only the field names.
+		t.Fatalf("expected a key ID and service account ID, got fields %v", responseFields(resp))
 	}
 
 	// Delete the key immediately, not just at the end of the test: nothing
 	// below needs it to survive, so keep the cloud-side cleanup window as
 	// short as possible even if an assertion fails.
-	c, err := b.getClient(context.Background(), storage)
+	c, releaseClient, err := b.getClient(context.Background(), storage)
 	if err != nil {
 		t.Fatalf("get client: %v", err)
 	}
+	t.Cleanup(releaseClient)
 	t.Cleanup(func() { _ = c.DeleteAPIKey(context.Background(), keyID) })
 
 	// Disabling isn't exposed on the CloudOps interface — the engine has no

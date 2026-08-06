@@ -2,7 +2,9 @@ package temporalcloud
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -146,6 +148,78 @@ func TestRotateRoot_FailsWhenUnconfigured(t *testing.T) {
 	})
 	if err == nil && (resp == nil || !resp.IsError()) {
 		t.Fatal("expected rotate-root to fail when the engine is not configured")
+	}
+}
+
+// Vault does not serialise requests to a path, so two rotations can overlap —
+// a duplicated cron entry or a retried request is enough. Unserialised, both
+// would mint a Global Admin key and both would store, and the loser's key
+// would survive for root_key_ttl as a working credential Vault no longer
+// records anywhere. Every key minted here except the one now in config must
+// therefore have been deleted.
+func TestRotateRoot_ConcurrentRotationsLeaveNoOrphanedKey(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	var mu sync.Mutex
+	minted := make([]string, 0, 2)
+
+	stub := &stubCloudOps{
+		createAPIKeyFn: func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			id := fmt.Sprintf("key-%d", len(minted)+1)
+			minted = append(minted, id)
+			return &client.APIKey{ID: id, Token: "tmprl_sk_" + id}, nil
+		},
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage) // stores api_key_id "key-bootstrap"
+
+	const rotations = 2
+	var wg sync.WaitGroup
+	wg.Add(rotations)
+	for i := 0; i < rotations; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := b.HandleRequest(context.Background(), &logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "config/rotate-root",
+				Storage:   storage,
+			}); err != nil {
+				t.Errorf("rotate-root: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	cfg, err := b.getConfig(context.Background(), storage)
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+
+	if len(minted) != rotations {
+		t.Fatalf("expected %d keys to be minted, got %v", rotations, minted)
+	}
+
+	// Exactly one minted key survives, and it is the one config now names.
+	deleted := make(map[string]bool, len(stub.deletedAPIKeys))
+	for _, id := range stub.deletedAPIKeys {
+		deleted[id] = true
+	}
+	for _, id := range minted {
+		if id == cfg.APIKeyID {
+			if deleted[id] {
+				t.Errorf("the stored root key %q was deleted", id)
+			}
+			continue
+		}
+		if !deleted[id] {
+			t.Errorf("key %q was minted, is not the stored credential, and was never "+
+				"deleted — it is an orphaned Global Admin credential", id)
+		}
+	}
+	if !deleted["key-bootstrap"] {
+		t.Error("expected the bootstrap key to be deleted")
 	}
 }
 

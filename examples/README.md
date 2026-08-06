@@ -17,7 +17,20 @@ Cloud Ops API call.
 ```bash
 export TEMPORAL_CLOUD_API_KEY="tcld_..."
 export TEMPORAL_CLOUD_ADMIN_SA_ID="svcacct-..."
+
+# Optional, but set it if you can — see below.
+export TEMPORAL_CLOUD_API_KEY_ID="apikey-..."
 ```
+
+**Set `TEMPORAL_CLOUD_API_KEY_ID` if you want step 2 to land.** It is the ID
+of the bootstrap key itself, shown next to the key in Settings → API Keys.
+Without it, Vault has no way to know which key to delete when it rotates: an
+API key token does not carry its own ID, and the Cloud Ops API has no call
+that maps one to the other. Rotation still succeeds — Vault starts using a key
+it minted itself — but it warns you, and the key you pasted stays valid until
+you delete it by hand. That is a real behaviour worth showing a customer, but
+show it deliberately, not by accident: with the ID set, the demo tells the
+whole story of the bootstrap credential being destroyed.
 
 ## Running it
 
@@ -45,7 +58,7 @@ export VAULT_TOKEN=root
 | Step | What happens | Where to look |
 | --- | --- | --- |
 | 1. Configure | Vault stores the bootstrap API key and validates it by reading the admin service account | Settings → API Keys — your pasted key is still there |
-| 2. Rotate root | Vault mints a fresh key on the admin service account, verifies it works, stores it, deletes the one you pasted | Settings → API Keys — the key from step 1 is gone, replaced by one named `vault-root-<timestamp>` |
+| 2. Rotate root | Vault mints a fresh key on the admin service account, verifies it works, stores it, and deletes the one you pasted — if it was told that key's ID | Settings → API Keys — a key named `vault-root-<timestamp>` appears. With `TEMPORAL_CLOUD_API_KEY_ID` set, the key from step 1 is gone; without it, that key is still listed and Vault warns you to delete it yourself |
 | 3. Create service account | Vault creates `demo-workers` with `read` account access | Settings → Identities — a new service account named `demo-workers` |
 | 4. Read a credential | Vault mints an API key on `demo-workers` and hands it back once, under a 5-minute lease | Settings → API Keys — a key named `vault-demo-workers-<random>` appears |
 | 5. Show the lease | `vault list` on `sys/leases/lookup` — nothing Temporal Cloud–side, just showing Vault's bookkeeping | — |

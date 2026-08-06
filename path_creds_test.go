@@ -2,6 +2,7 @@ package temporalcloud
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -240,6 +241,84 @@ func TestCreds_FailsAtCapacity(t *testing.T) {
 	}
 	if minted != 0 {
 		t.Error("no key should be minted once the cap is reached")
+	}
+}
+
+// An expired or under-privileged root key is an operator-fixable credential
+// problem, so it must read as one. Returning a Go error would render it as
+// "500 Internal Server Error", which reads as a plugin crash and sends the
+// operator looking in the wrong place entirely.
+func TestCreds_PermissionDeniedIsAnActionableErrorNotA500(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stub *stubCloudOps
+	}{
+		{
+			name: "counting keys",
+			stub: &stubCloudOps{
+				countAPIKeysFn: func(context.Context, string) (int, error) {
+					return 0, fmt.Errorf("%w: request unauthenticated", client.ErrPermissionDenied)
+				},
+			},
+		},
+		{
+			name: "minting the key",
+			stub: &stubCloudOps{
+				createAPIKeyFn: func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+					return nil, fmt.Errorf("%w: request unauthenticated", client.ErrPermissionDenied)
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, storage := newTestBackend(t)
+			withStubClient(b, tc.stub)
+			mustWriteConfig(t, b, storage)
+			mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{"account_role": "read"})
+
+			resp, err := b.HandleRequest(context.Background(), &logical.Request{
+				Operation: logical.ReadOperation,
+				Path:      "creds/prod-workers",
+				Storage:   storage,
+			})
+			if err != nil {
+				t.Fatalf("expected an error response, not a 500: %v", err)
+			}
+			if resp == nil || !resp.IsError() {
+				t.Fatal("expected the read to be refused")
+			}
+
+			msg := resp.Error().Error()
+			// It must still say what was being attempted, and point at the
+			// root credential as the likely cause.
+			if !strings.Contains(msg, "prod-workers") {
+				t.Errorf("expected the message to name the entry, got: %s", msg)
+			}
+			if !strings.Contains(msg, "rotate-root") {
+				t.Errorf("expected the message to suggest rotating the root key, got: %s", msg)
+			}
+		})
+	}
+}
+
+// ErrUnavailable is the opposite case: a genuine infrastructure failure, worth
+// retrying, and correctly a 500.
+func TestCreds_UnavailableStaysAGoError(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{
+		createAPIKeyFn: func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+			return nil, fmt.Errorf("%w: try again", client.ErrUnavailable)
+		},
+	})
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{"account_role": "read"})
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+	}); err == nil {
+		t.Fatal("expected an unavailable Temporal Cloud to surface as a retryable error")
 	}
 }
 

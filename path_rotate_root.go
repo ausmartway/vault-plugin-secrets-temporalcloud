@@ -36,6 +36,11 @@ func (b *backend) pathRotateRoot() *framework.Path {
 // a failure at the last step leaves two working keys rather than none. Every
 // intermediate failure leaves the mount usable.
 func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
+	// Held for the whole handler: see backend.rotateMu for why overlapping
+	// rotations are dangerous rather than merely wasteful.
+	b.rotateMu.Lock()
+	defer b.rotateMu.Unlock()
+
 	cfg, err := b.getConfig(ctx, req.Storage)
 	if err != nil {
 		return nil, err
@@ -44,10 +49,11 @@ func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request,
 		return logical.ErrorResponse(errBackendNotConfigured.Error()), nil
 	}
 
-	c, err := b.getClient(ctx, req.Storage)
+	c, release, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	// 1. Mint the replacement.
 	newKey, err := c.CreateAPIKey(ctx, client.APIKeySpec{
@@ -57,7 +63,7 @@ func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request,
 		ExpiryTime:       time.Now().Add(cfg.RootKeyTTL),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("minting a replacement root API key: %w", err)
+		return respondCloudErr("minting a replacement root API key", err)
 	}
 
 	// 2. Verify it before trusting it. A key that cannot read the admin
@@ -105,11 +111,12 @@ func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request,
 		return resp, nil
 	}
 
-	// Use verifyClient rather than c: resetClient above closed c's gRPC
-	// connection (c is the cached client getClient returned), and a call on a
-	// closed connection would always fail. verifyClient is authenticated with
-	// the new key, which has the same service-account permissions, and stays
-	// open until this function returns.
+	// Use verifyClient rather than c. c is the cached client, which resetClient
+	// above has retired: it stays usable until this handler releases it, but it
+	// is authenticated with the key we are about to delete, and deleting the
+	// credential you are authenticated with is the more surprising of the two
+	// orders. verifyClient holds the new key, has the same service-account
+	// permissions, and stays open until this function returns.
 	if err := verifyClient.DeleteAPIKey(ctx, cfg.APIKeyID); err != nil {
 		// The rotation itself succeeded, so this is a warning rather than an
 		// error: failing the request would suggest the new key is not in use.

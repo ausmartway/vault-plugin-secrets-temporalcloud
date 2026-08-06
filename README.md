@@ -45,8 +45,10 @@ export VAULT_TOKEN=root
 ```
 
 walks the full lifecycle: configure, rotate the bootstrap key away, create a
-service account, mint a credential, revoke it, tear down. See
-[`examples/README.md`](examples/README.md) for what to look at in the
+service account, mint a credential, revoke it, tear down. Also set
+`TEMPORAL_CLOUD_API_KEY_ID` to the bootstrap key's own ID if you have it —
+without it the rotation step cannot delete the key you pasted, and says so.
+See [`examples/README.md`](examples/README.md) for what to look at in the
 Temporal Cloud UI at each step.
 
 ## Paths
@@ -62,7 +64,7 @@ Temporal Cloud.
 | `admin_service_account_id` | Required. The ID of the service account that owns `api_key`. The Cloud Ops API has no "whoami" call — given only a token, there is no way to discover which identity it belongs to, and `rotate-root` needs that identity to mint a replacement. |
 | `api_key_id` | Optional. The ID of the key given in `api_key`, so `rotate-root` can delete the key it replaces. Not knowable for a hand-issued bootstrap key unless you looked it up yourself. |
 | `address` | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`. Override for PrivateLink or non-production endpoints. |
-| `root_key_ttl` | Expiry applied to keys minted by `rotate-root`. Defaults to 90 days. Maximum two years. |
+| `root_key_ttl` | Expiry applied to keys minted by `rotate-root`. Defaults to 90 days. Minimum 24 hours, maximum two years — Temporal Cloud enforces both, and a value outside them is rejected here at write time rather than by Temporal Cloud at rotation time. The 24-hour minimum is undocumented by Temporal Cloud; the usual way to run into it is setting a short `root_key_ttl` to demo rotation quickly. |
 
 Writing `config` validates the credential immediately by calling
 `GetServiceAccount` on `admin_service_account_id` — you find out now if the
@@ -134,11 +136,20 @@ vault read temporalcloud/service-accounts/prod-workers
 ```
 
 Deleting the entry deletes the service account in Temporal Cloud, which
-invalidates every API key it owns:
+invalidates every API key it owns. **Revoke the outstanding leases first:**
 
 ```bash
+vault lease revoke -prefix temporalcloud/creds/prod-workers
 vault delete temporalcloud/service-accounts/prod-workers
 ```
+
+Deleting the entry while leases are still outstanding leaves those leases
+pointing at API keys whose owning service account no longer exists. Vault will
+still revoke them on schedule, and revocation is written to treat an
+already-absent key as success — but that specific path (revoking a key whose
+service account was deleted out from under it) has never been observed against
+a live account, so it is not a path to rely on. Revoking first keeps teardown
+on behaviour that has been proven.
 
 #### Write semantics — read this before you write here
 
@@ -281,6 +292,15 @@ far more freely, scoped one path per application.
 - `make sweep` — deletes leftover `vault-acctest-*` resources from a live test
   run that died mid-flight instead of cleaning up after itself.
 
+The live suite reads four environment variables:
+
+| Variable | Required | What it does |
+| --- | --- | --- |
+| `TEMPORAL_CLOUD_API_KEY` | Yes | The root credential the tests configure the engine with. |
+| `TEMPORAL_CLOUD_ADMIN_SA_ID` | Yes | The ID of the service account owning that key. |
+| `TEMPORAL_CLOUD_API_KEY_ID` | No | The ID of that key. Without it, `TestLive_RotateRoot` cannot prove the old key was deleted — rotation just warns that it does not know which key to remove, which is the one thing that test exists to check. |
+| `TEMPORAL_CLOUD_ADDRESS` | No | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`; set it for PrivateLink or a non-production endpoint. |
+
 Two live tests are opt-in beyond the two required env vars, because of what
 they do:
 
@@ -300,7 +320,7 @@ vault read creds/prod-workers
   │
   ├─ 1. load service-accounts/prod-workers            (missing → error naming the path to create)
   ├─ 2. count non-expired API keys on that service account; ≥ 20 → fail with the ceiling message
-  ├─ 3. mint an API key on the service account, expiring at max(max_ttl + 10m, 24h)
+  ├─ 3. mint an API key on the service account, expiring at max(max_ttl + 10m, 24h + 10m)
   └─ 4. return the key under a Vault lease with ttl / max_ttl from the entry
 
 renew  → extend the lease, capped at max_ttl. No Temporal Cloud call.
@@ -317,13 +337,14 @@ grant — and a key orphaned by a Vault failure (crash, lost storage, a deleted
 mount) still self-destructs within one maximum lifetime rather than lingering
 forever.
 
-**Why it's `max(max_ttl + 10m, 24h)`, not just `max_ttl + 10m`.** Live testing
+**Why it's `max(max_ttl + 10m, 24h + 10m)`, not just `max_ttl + 10m`.** Live testing
 against the real Cloud Ops API found an undocumented rule: Temporal Cloud
 refuses to mint an API key expiring less than 24 hours from now. A
 `max_ttl` of 30 minutes — a perfectly reasonable lease ceiling — would make
 every mint fail outright with an "invalid argument" error naming that
 24-hour floor. The engine works around it by flooring the Temporal-side
-expiry at 24 hours when `max_ttl` is shorter than that.
+expiry at 24 hours plus the same 10-minute grace margin when `max_ttl` is
+shorter than that.
 
 This is a real, deliberate trade, and worth being straight about:
 
