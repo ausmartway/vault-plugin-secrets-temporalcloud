@@ -2407,7 +2407,15 @@ func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request,
 		return resp, nil
 	}
 
-	if err := c.DeleteAPIKey(ctx, cfg.APIKeyID); err != nil {
+	// Use verifyClient rather than c: b.resetClient() above closed c's gRPC
+	// connection (c is the cached client getClient returned), so a call on it
+	// would always fail. verifyClient is authenticated with the new key, which
+	// has the same service-account permissions, and stays open until return.
+	//
+	// This is invisible to the stub-based tests, because the stub's Close() is
+	// a no-op flag — it only bites against a real connection. Do not "simplify"
+	// it back to c.
+	if err := verifyClient.DeleteAPIKey(ctx, cfg.APIKeyID); err != nil {
 		// The rotation itself succeeded, so this is a warning rather than an
 		// error: failing the request would suggest the new key is not in use.
 		resp.AddWarning(fmt.Sprintf(
