@@ -53,17 +53,28 @@ Tests live beside their subject: `client/access_test.go`, `client/errors_test.go
 
 ---
 
-### Task 1: Repository scaffold and backend skeleton
+### Task 1: Scaffold, the `CloudOps` interface, and error mapping
 
-Produces a compiling, testable plugin with zero paths registered. Later tasks append paths.
+Produces a compiling plugin with zero paths registered, plus the seam every later task builds on. No placeholder or stub code is written at any point — the interface is real from the first commit.
 
 **Files:**
-- Create: `go.mod`, `Makefile`, `.gitignore`, `backend.go`, `cmd/vault-plugin-secrets-temporalcloud/main.go`
-- Test: `backend_test.go`
+- Create: `go.mod`, `Makefile`, `backend.go`, `cmd/vault-plugin-secrets-temporalcloud/main.go`, `client/client.go`, `client/errors.go`
+- Modify: `.gitignore` — it already exists and ignores `.superpowers/`. **Extend it, do not replace it.**
+- Test: `backend_test.go`, `client/errors_test.go`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error)`; `Backend() *backend`; the `backend` struct with fields `*framework.Backend`, `clientMu sync.RWMutex`, `client client.CloudOps`, `newClient func(*config) (client.CloudOps, error)`; test helper `newTestBackend(t *testing.T) (*backend, logical.Storage)`.
+- Produces:
+  - `Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error)`; `Backend() *backend`
+  - the `backend` struct with fields `*framework.Backend`, `clientMu sync.RWMutex`, `client client.CloudOps`
+  - `const configStoragePath = "config"` (declared in `backend.go`, used by `invalidate`)
+  - test helper `newTestBackend(t *testing.T) (*backend, logical.Storage)`
+  - `type CloudOps interface` with methods `CreateServiceAccount(ctx, ServiceAccountSpec) (string, error)`, `GetServiceAccount(ctx, string) (*ServiceAccount, error)`, `UpdateServiceAccount(ctx, string, ServiceAccountSpec) error`, `DeleteServiceAccount(ctx, string) error`, `CreateAPIKey(ctx, APIKeySpec) (*APIKey, error)`, `DeleteAPIKey(ctx, string) error`, `CountAPIKeys(ctx, string) (int, error)`, `Close() error`
+  - types `Config{APIKey, HostPort string}`, `ServiceAccountSpec{Name, Description, AccountRole string; NamespaceAccess map[string]string}`, `ServiceAccount{ID, ResourceVersion string; Spec ServiceAccountSpec}`, `APIKeySpec{ServiceAccountID, DisplayName, Description string; ExpiryTime time.Time}`, `APIKey{ID, Token string}`
+  - constants `MaxAPIKeysPerServiceAccount = 20`, `MaxAPIKeyExpiry = 2 * 365 * 24 * time.Hour`
+  - errors `ErrNotFound`, `ErrPermissionDenied`, `ErrInvalidArgument`, `ErrResourceExhausted`, `ErrUnavailable`, and `func MapGRPCError(error) error`
+
+Note there is deliberately **no `newClient` field on `backend` in this task**. It is added in Task 3, when `client.NewGRPC` exists to assign to it. Nothing in this task needs it, and a nil function field waiting to be filled in is exactly the kind of half-built state this restructuring avoids.
 
 - [ ] **Step 1: Initialise the module and fetch dependencies**
 
@@ -82,7 +93,9 @@ go list -m go.temporal.io/cloud-sdk github.com/hashicorp/vault/sdk
 #         github.com/hashicorp/vault/sdk v0.25.1
 ```
 
-- [ ] **Step 2: Write `.gitignore`**
+- [ ] **Step 2: Extend `.gitignore`**
+
+The file already exists with a `.superpowers/` entry. Append to it; do not overwrite:
 
 ```gitignore
 # Build output
@@ -95,347 +108,16 @@ vault-plugin-secrets-temporalcloud
 *.key
 ```
 
-- [ ] **Step 3: Write the failing test**
+- [ ] **Step 3: Write the failing tests**
 
-`backend_test.go` — a helper every later task reuses, plus a test that the backend constructs. `client` is not imported yet because no path needs it.
-
-```go
-package temporalcloud
-
-import (
-	"context"
-	"testing"
-
-	"github.com/hashicorp/vault/sdk/logical"
-)
-
-// newTestBackend builds a backend against in-memory storage. Tests drive it
-// through b.HandleRequest, exactly as Vault does, so no Vault binary is needed.
-func newTestBackend(t *testing.T) (*backend, logical.Storage) {
-	t.Helper()
-
-	storage := &logical.InmemStorage{}
-	conf := &logical.BackendConfig{
-		StorageView: storage,
-		Logger:      logging.NewVaultLogger(log.Trace),
-		System: &logical.StaticSystemView{
-			DefaultLeaseTTLVal: time.Hour,
-			MaxLeaseTTLVal:     24 * time.Hour,
-		},
-	}
-
-	b := Backend()
-	if err := b.Setup(context.Background(), conf); err != nil {
-		t.Fatalf("backend setup: %v", err)
-	}
-	return b, storage
-}
-
-func TestBackend_Constructs(t *testing.T) {
-	b, _ := newTestBackend(t)
-
-	if b.Backend == nil {
-		t.Fatal("expected embedded framework.Backend to be set")
-	}
-	if b.BackendType != logical.TypeLogical {
-		t.Fatalf("expected TypeLogical, got %v", b.BackendType)
-	}
-}
-```
-
-Add these imports to the file's import block:
-
-```go
-	"time"
-
-	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/vault/sdk/helper/logging"
-```
-
-Note: the correct import path for hclog is `github.com/hashicorp/go-hclog`. If `go build` reports it missing, use `github.com/hashicorp/go-hclog` as provided transitively by the Vault SDK — run `go mod tidy` and let it resolve.
-
-- [ ] **Step 4: Run the test to verify it fails**
-
-Run: `go test ./... -run TestBackend_Constructs -v`
-Expected: FAIL — `undefined: Backend`.
-
-- [ ] **Step 5: Write `backend.go`**
-
-```go
-// Package temporalcloud implements a HashiCorp Vault secrets engine for
-// Temporal Cloud. It provisions Temporal Cloud service accounts and issues
-// short-lived API keys as Vault dynamic secrets, deleting each key when its
-// Vault lease ends.
-package temporalcloud
-
-import (
-	"context"
-	"strings"
-	"sync"
-
-	"github.com/hashicorp/vault/sdk/framework"
-	"github.com/hashicorp/vault/sdk/logical"
-
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
-)
-
-// backend is the Temporal Cloud secrets engine.
-type backend struct {
-	*framework.Backend
-
-	// clientMu guards the cached Cloud Ops client. The client owns a gRPC
-	// connection, so we build it once and reuse it across requests rather
-	// than dialling per request.
-	clientMu sync.RWMutex
-	client   client.CloudOps
-
-	// newClient is a seam for tests: acceptance tests can substitute a
-	// constructor that points at a different account or address.
-	newClient func(cfg *config) (client.CloudOps, error)
-}
-
-// Factory is the entrypoint Vault calls to instantiate this plugin.
-func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
-	b := Backend()
-	if err := b.Setup(ctx, conf); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-// Backend constructs the engine without wiring it to Vault, so tests can
-// drive it directly.
-func Backend() *backend {
-	var b backend
-
-	b.newClient = client.NewGRPC
-
-	b.Backend = &framework.Backend{
-		Help:        strings.TrimSpace(backendHelp),
-		BackendType: logical.TypeLogical,
-		PathsSpecial: &logical.Paths{
-			// The root API key lives here, so it must be seal-wrapped.
-			SealWrapStorage: []string{"config"},
-		},
-		// Paths and Secrets are appended by later tasks.
-		Paths:      []*framework.Path{},
-		Secrets:    []*framework.Secret{},
-		Invalidate: b.invalidate,
-		Clean:      b.clean,
-	}
-
-	return &b
-}
-
-// invalidate drops the cached client when config changes, so the next request
-// rebuilds it with the new credential. Vault calls this on the active node and
-// on replicas when storage under the given key changes.
-func (b *backend) invalidate(_ context.Context, key string) {
-	if key == configStoragePath {
-		b.resetClient()
-	}
-}
-
-// clean closes the gRPC connection when the mount is unmounted or sealed.
-func (b *backend) clean(_ context.Context) {
-	b.resetClient()
-}
-
-// resetClient closes and clears the cached client.
-func (b *backend) resetClient() {
-	b.clientMu.Lock()
-	defer b.clientMu.Unlock()
-
-	if b.client != nil {
-		// Close errors are not actionable here: we are discarding the client
-		// either way, and returning an error would block invalidation.
-		_ = b.client.Close()
-		b.client = nil
-	}
-}
-
-const backendHelp = `
-The Temporal Cloud secrets engine provisions Temporal Cloud service accounts and
-issues short-lived Temporal Cloud API keys bound to Vault leases.
-
-Configure the engine with a Global Admin service account API key at the "config"
-path, define service accounts under "service-accounts/", then read credentials
-from "creds/<name>".
-`
-```
-
-`configStoragePath`, `config`, and `client.NewGRPC` do not exist yet. To keep this task compiling on its own, also create the two placeholder declarations below — Tasks 2 and 5 replace them with real implementations.
-
-In a new file `placeholders.go` (deleted in Task 5):
-
-```go
-package temporalcloud
-
-// configStoragePath is the storage key for the engine's configuration.
-// Task 5 moves this to path_config.go along with the config type.
-const configStoragePath = "config"
-
-// config is replaced by the real type in Task 5.
-type config struct{}
-```
-
-And in `client/client.go`, the minimum needed to compile (Task 2 replaces the whole file):
-
-```go
-package client
-
-// CloudOps is replaced by the real interface in Task 2.
-type CloudOps interface {
-	Close() error
-}
-
-// NewGRPC is replaced by the real constructor in Task 4.
-func NewGRPC(_ any) (CloudOps, error) { return nil, nil }
-```
-
-Adjust `b.newClient = client.NewGRPC` to compile against this signature by declaring the field as `func(cfg *config) (client.CloudOps, error)` and assigning a small adapter for now:
-
-```go
-	b.newClient = func(cfg *config) (client.CloudOps, error) {
-		return client.NewGRPC(cfg)
-	}
-```
-
-- [ ] **Step 6: Write the plugin entrypoint**
-
-`cmd/vault-plugin-secrets-temporalcloud/main.go`:
-
-```go
-// Command vault-plugin-secrets-temporalcloud serves the Temporal Cloud
-// secrets engine as an external Vault plugin.
-package main
-
-import (
-	"os"
-
-	hclog "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/vault/api"
-	"github.com/hashicorp/vault/sdk/plugin"
-
-	temporalcloud "github.com/temporal-sa/vault-plugin-temporalcloud"
-)
-
-func main() {
-	apiClientMeta := &api.PluginAPIClientMeta{}
-	flags := apiClientMeta.FlagSet()
-	if err := flags.Parse(os.Args[1:]); err != nil {
-		logFatal(err)
-	}
-
-	tlsConfig := apiClientMeta.GetTLSConfig()
-	tlsProviderFunc := api.VaultPluginTLSProvider(tlsConfig)
-
-	if err := plugin.ServeMultiplex(&plugin.ServeOpts{
-		BackendFactoryFunc: temporalcloud.Factory,
-		TLSProviderFunc:    tlsProviderFunc,
-	}); err != nil {
-		logFatal(err)
-	}
-}
-
-func logFatal(err error) {
-	hclog.New(&hclog.LoggerOptions{}).Error("plugin shutting down", "error", err)
-	os.Exit(1)
-}
-```
-
-Run `go mod tidy` — it will add `github.com/hashicorp/vault/api`.
-
-- [ ] **Step 7: Write the Makefile**
-
-```makefile
-PLUGIN_NAME := vault-plugin-secrets-temporalcloud
-PLUGIN_DIR  := ./bin
-MOUNT       := temporalcloud
-
-.PHONY: build test test-live sweep dev fmt lint clean
-
-## build: compile the plugin and print the SHA256 Vault needs for registration
-build:
-	@mkdir -p $(PLUGIN_DIR)
-	go build -o $(PLUGIN_DIR)/$(PLUGIN_NAME) ./cmd/$(PLUGIN_NAME)
-	@echo "SHA256: $$(shasum -a 256 $(PLUGIN_DIR)/$(PLUGIN_NAME) | cut -d' ' -f1)"
-
-## test: fast tests only — no credentials, no network
-test:
-	go test ./... -count=1
-
-## test-live: tests against a real Temporal Cloud account
-test-live:
-	@test -n "$$TEMPORAL_CLOUD_API_KEY" || \
-		(echo "TEMPORAL_CLOUD_API_KEY is not set. See README 'Running live tests'."; exit 1)
-	@test -n "$$TEMPORAL_CLOUD_ADMIN_SA_ID" || \
-		(echo "TEMPORAL_CLOUD_ADMIN_SA_ID is not set. See README 'Running live tests'."; exit 1)
-	go test ./... -tags=acceptance -count=1 -v -timeout 20m
-
-## sweep: delete leftover vault-acctest- resources from failed live tests
-sweep:
-	go run ./cmd/sweep
-
-fmt:
-	gofmt -w .
-
-lint:
-	golangci-lint run
-
-clean:
-	rm -rf $(PLUGIN_DIR)
-```
-
-The `dev` target is added in Task 10, once there is something to demo.
-
-- [ ] **Step 8: Run the test to verify it passes**
-
-Run: `gofmt -w . && go mod tidy && go test ./... -v`
-Expected: PASS — `TestBackend_Constructs`.
-
-- [ ] **Step 9: Verify the plugin binary builds**
-
-Run: `make build`
-Expected: a binary in `bin/` and a printed SHA256.
-
-- [ ] **Step 10: Commit**
-
-```bash
-git add .
-git commit -m "feat: scaffold Vault plugin with backend skeleton
-
-Module, Makefile, plugin entrypoint, and a framework.Backend with no paths
-registered yet. Later tasks append paths and secrets."
-```
-
----
-
-### Task 2: `CloudOps` interface and its plain-Go types
-
-Defines the seam. No gRPC yet — this task is types plus the error taxonomy that path handlers switch on.
-
-**Files:**
-- Create: `client/client.go`, `client/errors.go`
-- Test: `client/errors_test.go`
-- Delete: the placeholder `CloudOps`/`NewGRPC` from Task 1's `client/client.go` (overwrite the file)
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces:
-  - `type CloudOps interface` with methods `CreateServiceAccount(ctx, ServiceAccountSpec) (string, error)`, `GetServiceAccount(ctx, string) (*ServiceAccount, error)`, `UpdateServiceAccount(ctx, string, ServiceAccountSpec) error`, `DeleteServiceAccount(ctx, string) error`, `CreateAPIKey(ctx, APIKeySpec) (*APIKey, error)`, `DeleteAPIKey(ctx, string) error`, `CountAPIKeys(ctx, string) (int, error)`, `Close() error`
-  - Types `ServiceAccountSpec{Name, Description string; AccountRole string; NamespaceAccess map[string]string}`, `ServiceAccount{ID, ResourceVersion string; Spec ServiceAccountSpec}`, `APIKeySpec{ServiceAccountID, DisplayName, Description string; ExpiryTime time.Time}`, `APIKey{ID, Token string}`
-  - Errors `ErrNotFound`, `ErrPermissionDenied`, `ErrInvalidArgument`, `ErrResourceExhausted`, `ErrUnavailable`, and `func MapGRPCError(error) error`
-
-- [ ] **Step 1: Write the failing test**
-
-`client/errors_test.go`:
+Two test files. First `client/errors_test.go`:
 
 ```go
 package client
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -499,14 +181,160 @@ func TestMapGRPCError_NonGRPCPassesThrough(t *testing.T) {
 }
 ```
 
-Add `"strings"` to that file's imports.
+Then `backend_test.go` — the helper every later task reuses:
 
-- [ ] **Step 2: Run the test to verify it fails**
+```go
+package temporalcloud
 
-Run: `go test ./client/... -v`
-Expected: FAIL — `undefined: MapGRPCError`.
+import (
+	"context"
+	"testing"
 
-- [ ] **Step 3: Write `client/errors.go`**
+	"github.com/hashicorp/vault/sdk/logical"
+)
+
+// newTestBackend builds a backend against in-memory storage. Tests drive it
+// through b.HandleRequest, exactly as Vault does, so no Vault binary is needed.
+func newTestBackend(t *testing.T) (*backend, logical.Storage) {
+	t.Helper()
+
+	// TestBackendConfig supplies a logger and system view already; we only
+	// need to attach storage.
+	conf := logical.TestBackendConfig()
+	conf.StorageView = &logical.InmemStorage{}
+
+	b := Backend()
+	if err := b.Setup(context.Background(), conf); err != nil {
+		t.Fatalf("backend setup: %v", err)
+	}
+	return b, conf.StorageView
+}
+
+func TestBackend_Constructs(t *testing.T) {
+	b, _ := newTestBackend(t)
+
+	if b.Backend == nil {
+		t.Fatal("expected embedded framework.Backend to be set")
+	}
+	if b.BackendType != logical.TypeLogical {
+		t.Fatalf("expected TypeLogical, got %v", b.BackendType)
+	}
+}
+```
+
+The only imports `backend_test.go` needs are `context`, `testing`, and `github.com/hashicorp/vault/sdk/logical` — verified against vault/sdk v0.25.1, where `logical.TestBackendConfig()` already supplies the logger and system view.
+
+- [ ] **Step 4: Run the tests to verify they fail**
+
+Run: `go test ./... -v`
+Expected: FAIL — `undefined: MapGRPCError`, `undefined: Backend`.
+
+- [ ] **Step 5: Write `client/client.go`**
+
+```go
+// Package client wraps the Temporal Cloud Ops API for the Vault secrets
+// engine. It is the only package that knows about gRPC or the Cloud Ops API's
+// asynchronous operation model; everything above it works in plain Go types.
+package client
+
+import (
+	"context"
+	"time"
+)
+
+// CloudOps is the seam between Vault logic and Temporal Cloud. Every method
+// blocks until the underlying Cloud Ops async operation reaches a terminal
+// state, so callers never poll.
+type CloudOps interface {
+	// CreateServiceAccount creates a service account and returns its ID.
+	CreateServiceAccount(ctx context.Context, spec ServiceAccountSpec) (string, error)
+
+	// GetServiceAccount fetches a service account, including the resource
+	// version needed for optimistic concurrency on updates and deletes.
+	GetServiceAccount(ctx context.Context, id string) (*ServiceAccount, error)
+
+	// UpdateServiceAccount replaces a service account's spec. The current
+	// resource version is fetched internally.
+	UpdateServiceAccount(ctx context.Context, id string, spec ServiceAccountSpec) error
+
+	// DeleteServiceAccount deletes a service account. Temporal Cloud also
+	// invalidates the API keys it owns.
+	DeleteServiceAccount(ctx context.Context, id string) error
+
+	// CreateAPIKey mints an API key. The returned APIKey carries the token,
+	// which Temporal Cloud reveals exactly once.
+	CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey, error)
+
+	// DeleteAPIKey deletes an API key by ID.
+	DeleteAPIKey(ctx context.Context, id string) error
+
+	// CountAPIKeys counts non-expired API keys owned by a service account,
+	// used to check Temporal Cloud's per-service-account ceiling before
+	// minting another.
+	CountAPIKeys(ctx context.Context, serviceAccountID string) (int, error)
+
+	// Close releases the underlying connection.
+	Close() error
+}
+
+// Config is what a CloudOps implementation needs to reach Temporal Cloud.
+type Config struct {
+	// APIKey is a Temporal Cloud API key owned by a service account with the
+	// Global Admin role.
+	APIKey string
+
+	// HostPort overrides the Cloud Ops API address. Empty means the SDK
+	// default, saas-api.tmprl.cloud:443.
+	HostPort string
+}
+
+// ServiceAccountSpec describes a Temporal Cloud service account. AccountRole
+// and the values of NamespaceAccess are the lowercase forms an operator writes
+// ("developer", "write"); client/access.go validates and converts them.
+type ServiceAccountSpec struct {
+	Name        string
+	Description string
+	AccountRole string
+
+	// NamespaceAccess maps a fully-qualified namespace ("prod.acct1") to a
+	// permission ("admin", "write", or "read").
+	NamespaceAccess map[string]string
+}
+
+// ServiceAccount is a service account as Temporal Cloud reports it.
+type ServiceAccount struct {
+	ID              string
+	ResourceVersion string
+	Spec            ServiceAccountSpec
+}
+
+// APIKeySpec describes an API key to mint. ExpiryTime is mandatory: Temporal
+// Cloud has no non-expiring keys, and the maximum is two years out.
+type APIKeySpec struct {
+	ServiceAccountID string
+	DisplayName      string
+	Description      string
+	ExpiryTime       time.Time
+}
+
+// APIKey is a newly minted API key. Token is populated only at creation and is
+// never persisted by this engine.
+type APIKey struct {
+	ID    string
+	Token string
+}
+
+// MaxAPIKeysPerServiceAccount is Temporal Cloud's ceiling on non-expired API
+// keys owned by one service account, and therefore this engine's ceiling on
+// concurrent leases per service-accounts/<name> entry.
+const MaxAPIKeysPerServiceAccount = 20
+
+// MaxAPIKeyExpiry is the furthest out Temporal Cloud will accept an API key
+// expiry time.
+const MaxAPIKeyExpiry = 2 * 365 * 24 * time.Hour
+```
+
+- [ ] **Step 6: Write `client/errors.go`**
 
 ```go
 package client
@@ -577,130 +405,221 @@ func MapGRPCError(err error) error {
 }
 ```
 
-- [ ] **Step 4: Write `client/client.go`, replacing the placeholder**
+- [ ] **Step 7: Write `backend.go`**
 
 ```go
-// Package client wraps the Temporal Cloud Ops API for the Vault secrets
-// engine. It is the only package that knows about gRPC or the Cloud Ops API's
-// asynchronous operation model; everything above it works in plain Go types.
-package client
+// Package temporalcloud implements a HashiCorp Vault secrets engine for
+// Temporal Cloud. It provisions Temporal Cloud service accounts and issues
+// short-lived API keys as Vault dynamic secrets, deleting each key when its
+// Vault lease ends.
+package temporalcloud
 
 import (
 	"context"
-	"time"
+	"strings"
+	"sync"
+
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
+
+	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
 )
 
-// CloudOps is the seam between Vault logic and Temporal Cloud. Every method
-// blocks until the underlying Cloud Ops async operation reaches a terminal
-// state, so callers never poll.
-type CloudOps interface {
-	// CreateServiceAccount creates a service account and returns its ID.
-	CreateServiceAccount(ctx context.Context, spec ServiceAccountSpec) (string, error)
+// configStoragePath is the storage key holding the engine's configuration.
+const configStoragePath = "config"
 
-	// GetServiceAccount fetches a service account, including the resource
-	// version needed for optimistic concurrency on updates and deletes.
-	GetServiceAccount(ctx context.Context, id string) (*ServiceAccount, error)
+// backend is the Temporal Cloud secrets engine.
+type backend struct {
+	*framework.Backend
 
-	// UpdateServiceAccount replaces a service account's spec. The current
-	// resource version is fetched internally.
-	UpdateServiceAccount(ctx context.Context, id string, spec ServiceAccountSpec) error
-
-	// DeleteServiceAccount deletes a service account. Temporal Cloud also
-	// invalidates the API keys it owns.
-	DeleteServiceAccount(ctx context.Context, id string) error
-
-	// CreateAPIKey mints an API key. The returned APIKey carries the token,
-	// which Temporal Cloud reveals exactly once.
-	CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey, error)
-
-	// DeleteAPIKey deletes an API key by ID.
-	DeleteAPIKey(ctx context.Context, id string) error
-
-	// CountAPIKeys counts non-expired API keys owned by a service account,
-	// used to check Temporal Cloud's per-service-account ceiling before
-	// minting another.
-	CountAPIKeys(ctx context.Context, serviceAccountID string) (int, error)
-
-	// Close releases the underlying connection.
-	Close() error
+	// clientMu guards the cached Cloud Ops client. The client owns a gRPC
+	// connection, so we build it once and reuse it across requests rather
+	// than dialling per request.
+	clientMu sync.RWMutex
+	client   client.CloudOps
 }
 
-// ServiceAccountSpec describes a Temporal Cloud service account. AccountRole
-// and the values of NamespaceAccess are the lowercase forms an operator writes
-// ("developer", "write"); client/access.go validates and converts them.
-type ServiceAccountSpec struct {
-	Name        string
-	Description string
-	AccountRole string
-
-	// NamespaceAccess maps a fully-qualified namespace ("prod.acct1") to a
-	// permission ("admin", "write", or "read").
-	NamespaceAccess map[string]string
+// Factory is the entrypoint Vault calls to instantiate this plugin.
+func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
+	b := Backend()
+	if err := b.Setup(ctx, conf); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
-// ServiceAccount is a service account as Temporal Cloud reports it.
-type ServiceAccount struct {
-	ID              string
-	ResourceVersion string
-	Spec            ServiceAccountSpec
+// Backend constructs the engine without wiring it to Vault, so tests can
+// drive it directly.
+func Backend() *backend {
+	var b backend
+
+	b.Backend = &framework.Backend{
+		Help:        strings.TrimSpace(backendHelp),
+		BackendType: logical.TypeLogical,
+		PathsSpecial: &logical.Paths{
+			// The root API key lives here, so it must be seal-wrapped.
+			SealWrapStorage: []string{configStoragePath},
+		},
+		// Paths and Secrets are appended by later tasks.
+		Paths:      []*framework.Path{},
+		Secrets:    []*framework.Secret{},
+		Invalidate: b.invalidate,
+		Clean:      b.clean,
+	}
+
+	return &b
 }
 
-// APIKeySpec describes an API key to mint. ExpiryTime is mandatory: Temporal
-// Cloud has no non-expiring keys, and the maximum is two years out.
-type APIKeySpec struct {
-	ServiceAccountID string
-	DisplayName      string
-	Description      string
-	ExpiryTime       time.Time
+// invalidate drops the cached client when config changes, so the next request
+// rebuilds it with the new credential. Vault calls this on the active node and
+// on replicas when storage under the given key changes.
+func (b *backend) invalidate(_ context.Context, key string) {
+	if key == configStoragePath {
+		b.resetClient()
+	}
 }
 
-// APIKey is a newly minted API key. Token is populated only at creation and is
-// never persisted by this engine.
-type APIKey struct {
-	ID    string
-	Token string
+// clean closes the gRPC connection when the mount is unmounted or sealed.
+func (b *backend) clean(_ context.Context) {
+	b.resetClient()
 }
 
-// MaxAPIKeysPerServiceAccount is Temporal Cloud's ceiling on non-expired API
-// keys owned by one service account, and therefore this engine's ceiling on
-// concurrent leases per service-accounts/<name> entry.
-const MaxAPIKeysPerServiceAccount = 20
+// resetClient closes and clears the cached client.
+func (b *backend) resetClient() {
+	b.clientMu.Lock()
+	defer b.clientMu.Unlock()
 
-// MaxAPIKeyExpiry is the furthest out Temporal Cloud will accept an API key
-// expiry time.
-const MaxAPIKeyExpiry = 2 * 365 * 24 * time.Hour
+	if b.client != nil {
+		// Close errors are not actionable here: we are discarding the client
+		// either way, and returning an error would block invalidation.
+		_ = b.client.Close()
+		b.client = nil
+	}
+}
+
+const backendHelp = `
+The Temporal Cloud secrets engine provisions Temporal Cloud service accounts and
+issues short-lived Temporal Cloud API keys bound to Vault leases.
+
+Configure the engine with a Global Admin service account API key at the "config"
+path, define service accounts under "service-accounts/", then read credentials
+from "creds/<name>".
+`
 ```
 
-- [ ] **Step 5: Fix `backend.go` for the real interface**
+- [ ] **Step 8: Write the plugin entrypoint**
 
-Task 1's adapter assigned `client.NewGRPC` with an `any` parameter. `NewGRPC` does not exist yet — Task 4 adds it. For now, leave `newClient` nil-valued by deleting the assignment line from `Backend()`, and add a comment:
+`cmd/vault-plugin-secrets-temporalcloud/main.go`:
 
 ```go
-	// newClient is assigned in Task 4, once the gRPC implementation exists.
-	// Until then it stays nil; no path calls it yet.
+// Command vault-plugin-secrets-temporalcloud serves the Temporal Cloud
+// secrets engine as an external Vault plugin.
+package main
+
+import (
+	"os"
+
+	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault/api"
+	"github.com/hashicorp/vault/sdk/plugin"
+
+	temporalcloud "github.com/temporal-sa/vault-plugin-temporalcloud"
+)
+
+func main() {
+	apiClientMeta := &api.PluginAPIClientMeta{}
+	flags := apiClientMeta.FlagSet()
+	if err := flags.Parse(os.Args[1:]); err != nil {
+		logFatal(err)
+	}
+
+	tlsConfig := apiClientMeta.GetTLSConfig()
+	tlsProviderFunc := api.VaultPluginTLSProvider(tlsConfig)
+
+	if err := plugin.ServeMultiplex(&plugin.ServeOpts{
+		BackendFactoryFunc: temporalcloud.Factory,
+		TLSProviderFunc:    tlsProviderFunc,
+	}); err != nil {
+		logFatal(err)
+	}
+}
+
+func logFatal(err error) {
+	hclog.New(&hclog.LoggerOptions{}).Error("plugin shutting down", "error", err)
+	os.Exit(1)
+}
 ```
 
-Delete `client/client.go`'s placeholder `NewGRPC` if you have not already (it was replaced wholesale in Step 4).
+Run `go mod tidy` — it will add `github.com/hashicorp/vault/api`.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 9: Write the Makefile**
+
+```makefile
+PLUGIN_NAME := vault-plugin-secrets-temporalcloud
+PLUGIN_DIR  := ./bin
+MOUNT       := temporalcloud
+
+.PHONY: build test test-live sweep dev fmt lint clean
+
+## build: compile the plugin and print the SHA256 Vault needs for registration
+build:
+	@mkdir -p $(PLUGIN_DIR)
+	go build -o $(PLUGIN_DIR)/$(PLUGIN_NAME) ./cmd/$(PLUGIN_NAME)
+	@echo "SHA256: $$(shasum -a 256 $(PLUGIN_DIR)/$(PLUGIN_NAME) | cut -d' ' -f1)"
+
+## test: fast tests only — no credentials, no network
+test:
+	go test ./... -count=1
+
+## test-live: tests against a real Temporal Cloud account
+test-live:
+	@test -n "$$TEMPORAL_CLOUD_API_KEY" || \
+		(echo "TEMPORAL_CLOUD_API_KEY is not set. See README 'Running live tests'."; exit 1)
+	@test -n "$$TEMPORAL_CLOUD_ADMIN_SA_ID" || \
+		(echo "TEMPORAL_CLOUD_ADMIN_SA_ID is not set. See README 'Running live tests'."; exit 1)
+	go test ./... -tags=acceptance -count=1 -v -timeout 20m
+
+## sweep: delete leftover vault-acctest- resources from failed live tests
+sweep:
+	go run ./cmd/sweep
+
+fmt:
+	gofmt -w .
+
+lint:
+	golangci-lint run
+
+clean:
+	rm -rf $(PLUGIN_DIR)
+```
+
+The `dev` target is added in Task 9, once there is something to demo. `make sweep` will not run until Task 8 creates `cmd/sweep`; that is expected.
+
+- [ ] **Step 10: Run the tests to verify they pass**
 
 Run: `gofmt -w . && go mod tidy && go test ./... -v`
-Expected: PASS — all `TestMapGRPCError*` tests and `TestBackend_Constructs`.
+Expected: PASS — `TestBackend_Constructs` and all three `TestMapGRPCError*` tests.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 11: Verify the plugin binary builds**
+
+Run: `make build`
+Expected: a binary in `bin/` and a printed SHA256.
+
+- [ ] **Step 12: Commit**
 
 ```bash
 git add .
-git commit -m "feat(client): add CloudOps interface and gRPC error mapping
+git commit -m "feat: scaffold plugin with the CloudOps interface and error mapping
 
-Defines the seam between Vault logic and Temporal Cloud: plain-Go request and
-response types, and sentinel errors that path handlers switch on without
-importing grpc/codes."
+Module, Makefile, plugin entrypoint, and a framework.Backend with no paths
+registered yet. Also defines the seam between Vault logic and Temporal Cloud:
+plain-Go request and response types, and sentinel errors that path handlers
+switch on without importing grpc/codes."
 ```
 
 ---
 
-### Task 3: Access parsing and validation
+### Task 2: Access parsing and validation
 
 Converts the strings an operator writes into Temporal Cloud protos. Pure functions, no network — the densest validation logic in the engine and the cheapest to test.
 
@@ -1076,18 +995,18 @@ that list the valid values, and round-trips them back for reads."
 
 ---
 
-### Task 4: Async operation polling and the gRPC client
+### Task 3: Async operation polling and the gRPC client
 
 Implements `CloudOps` for real. This is the only file that touches gRPC.
 
 **Files:**
 - Create: `client/async.go`, `client/grpc.go`
-- Modify: `backend.go` — restore the `newClient` assignment removed in Task 2
+- Modify: `backend.go` — add the `newClient` field and assign it
 - Test: `client/async_test.go`
 
 **Interfaces:**
 - Consumes: everything from Tasks 2 and 3.
-- Produces: `func NewGRPC(cfg Config) (CloudOps, error)`; `type Config struct{ APIKey, HostPort string }`; `type grpcClient struct` implementing `CloudOps`; `func awaitOperation(ctx context.Context, svc cloudservicev1.CloudServiceClient, op *operationv1.AsyncOperation) error`.
+- Produces: `func NewGRPC(cfg Config) (CloudOps, error)` (`Config` already exists from Task 1); `type grpcClient struct` implementing `CloudOps`; `func awaitOperation(ctx context.Context, svc cloudservicev1.CloudServiceClient, op *operationv1.AsyncOperation) error`; `func classifyOperationState(*operationv1.AsyncOperation) (bool, error)`; and on `backend`, the new field `newClient func(client.Config) (client.CloudOps, error)`.
 
 Import aliases: `cloudservicev1 "go.temporal.io/cloud-sdk/api/cloudservice/v1"`, `operationv1 "go.temporal.io/cloud-sdk/api/operation/v1"`, `"go.temporal.io/cloud-sdk/cloudclient"`.
 
@@ -1308,16 +1227,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// Config is what NewGRPC needs to reach Temporal Cloud.
-type Config struct {
-	// APIKey is a Temporal Cloud API key owned by a service account with the
-	// Global Admin role.
-	APIKey string
-
-	// HostPort overrides the Cloud Ops API address. Empty means the SDK
-	// default, saas-api.tmprl.cloud:443.
-	HostPort string
-}
+// Config already exists in client.go from Task 1 — do not redeclare it here.
 
 // grpcClient implements CloudOps against the real Cloud Ops API.
 type grpcClient struct {
@@ -1521,27 +1431,24 @@ func specFromProto(p *identityv1.ServiceAccountSpec) ServiceAccountSpec {
 
 The `OwnerType` constant identifier is `identityv1.OwnerType_OWNER_TYPE_SERVICE_ACCOUNT` — verified against v0.16.0's generated code, note the `OwnerType_` prefix on an already-prefixed name.
 
-- [ ] **Step 6: Restore the client constructor in `backend.go`**
+- [ ] **Step 6: Add the client constructor field to `backend.go`**
 
-Replace the Task 2 placeholder comment in `Backend()` with the real assignment:
-
-```go
-	b.newClient = func(cfg *config) (client.CloudOps, error) {
-		return client.NewGRPC(client.Config{
-			APIKey:   cfg.APIKey,
-			HostPort: cfg.Address,
-		})
-	}
-```
-
-`config.APIKey` and `config.Address` do not exist until Task 5. Keep the placeholder `config` struct compiling by giving it those two fields now, in `placeholders.go`:
+Add the field to the `backend` struct, after `client`:
 
 ```go
-type config struct {
-	APIKey  string
-	Address string
-}
+	// newClient builds a Cloud Ops client. It is a field rather than a direct
+	// call to client.NewGRPC so tests can substitute a stub without dialling
+	// Temporal Cloud.
+	newClient func(cfg client.Config) (client.CloudOps, error)
 ```
+
+And assign it in `Backend()`, before the `b.Backend = ...` block:
+
+```go
+	b.newClient = client.NewGRPC
+```
+
+The signatures match exactly, so no adapter closure is needed. Task 4 converts the stored `config` into a `client.Config` at the call site.
 
 - [ ] **Step 7: Verify everything builds and the fast tests pass**
 
@@ -1561,13 +1468,12 @@ idempotency keys come from the SDK's default interceptors."
 
 ---
 
-### Task 5: The `config` path
+### Task 4: The `config` path
 
 Stores the root credential and validates it against Temporal Cloud on write.
 
 **Files:**
 - Create: `path_config.go`
-- Delete: `placeholders.go`
 - Modify: `backend.go` — register the path, add `getClient`
 - Test: `path_config_test.go`
 
@@ -1654,7 +1560,7 @@ func (s *stubCloudOps) Close() error {
 // withStubClient makes the backend use the given stub instead of dialling
 // Temporal Cloud.
 func withStubClient(b *backend, stub client.CloudOps) {
-	b.newClient = func(*config) (client.CloudOps, error) { return stub, nil }
+	b.newClient = func(client.Config) (client.CloudOps, error) { return stub, nil }
 }
 
 func TestConfig_WriteAndRead(t *testing.T) {
@@ -1990,7 +1896,7 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	// Validate before persisting. One GetServiceAccount call proves both that
 	// the key authenticates and that admin_service_account_id is correct, so
 	// the operator learns about a mistake now rather than at first use.
-	c, err := b.newClient(cfg)
+	c, err := b.newClient(cfg.clientConfig())
 	if err != nil {
 		return logical.ErrorResponse("could not build a Temporal Cloud client: %s", err), nil
 	}
@@ -2058,6 +1964,12 @@ func (b *backend) pathConfigDelete(ctx context.Context, req *logical.Request, _ 
 	return nil, nil
 }
 
+// clientConfig converts the stored configuration into what the client package
+// needs, keeping Vault's field names out of the client package.
+func (c *config) clientConfig() client.Config {
+	return client.Config{APIKey: c.APIKey, HostPort: c.Address}
+}
+
 // getConfig loads the stored configuration, returning nil if unconfigured.
 func (b *backend) getConfig(ctx context.Context, s logical.Storage) (*config, error) {
 	entry, err := s.Get(ctx, configStoragePath)
@@ -2091,7 +2003,7 @@ bootstrap key with one only it holds.
 
 - [ ] **Step 4: Add `getClient` and register the path in `backend.go`**
 
-Delete `placeholders.go`. Register the path:
+Register the path:
 
 ```go
 		Paths: []*framework.Path{
@@ -2129,7 +2041,7 @@ func (b *backend) getClient(ctx context.Context, s logical.Storage) (client.Clou
 		return nil, errBackendNotConfigured
 	}
 
-	c, err := b.newClient(cfg)
+	c, err := b.newClient(cfg.clientConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -2169,7 +2081,7 @@ Reads never return api_key."
 
 ---
 
-### Task 6: `config/rotate-root`
+### Task 5: `config/rotate-root`
 
 Replaces the root credential with one only Vault has seen.
 
@@ -2454,7 +2366,7 @@ func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request,
 	newCfg.APIKey = newKey.Token
 	newCfg.APIKeyID = newKey.ID
 
-	verifyClient, err := b.newClient(&newCfg)
+	verifyClient, err := b.newClient(newCfg.clientConfig())
 	if err != nil {
 		return nil, fmt.Errorf("building a client for the new root key: %w", err)
 	}
@@ -2551,7 +2463,7 @@ replacement is cleaned up rather than left to consume a key slot."
 
 ---
 
-### Task 7: The `service-accounts/<name>` path
+### Task 6: The `service-accounts/<name>` path
 
 Full CRUD against Temporal Cloud, plus the TTL fields `creds/` will consume.
 
@@ -3017,7 +2929,7 @@ const (
 
 	// apiKeyExpiryGrace is added to max_ttl when setting a key's Temporal
 	// Cloud expiry, so a key never expires before the lease that owns it.
-	// Task 8 uses this when minting.
+	// Task 7 uses this when minting.
 	apiKeyExpiryGrace = 10 * time.Minute
 )
 
@@ -3408,7 +3320,7 @@ service account it just created."
 
 ---
 
-### Task 8: `creds/<name>` and the lease lifecycle
+### Task 7: `creds/<name>` and the lease lifecycle
 
 The heart of the engine: mint a key per lease, revoke it when the lease ends.
 
@@ -4015,7 +3927,7 @@ so renewal needs no Cloud Ops call and orphaned keys self-destruct."
 
 ---
 
-### Task 9: Live acceptance tests and the sweeper
+### Task 8: Live acceptance tests and the sweeper
 
 The first task that proves anything against real Temporal Cloud. Everything before this was verified only against stubs.
 
@@ -4052,8 +3964,6 @@ import (
 	"testing"
 	"time"
 
-	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/vault/sdk/helper/logging"
 	"github.com/hashicorp/vault/sdk/logical"
 
 	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
@@ -4074,16 +3984,12 @@ func liveBackend(t *testing.T) (*backend, logical.Storage) {
 		t.Skip("set TEMPORAL_CLOUD_API_KEY and TEMPORAL_CLOUD_ADMIN_SA_ID to run live tests")
 	}
 
-	storage := &logical.InmemStorage{}
+	conf := logical.TestBackendConfig()
+	conf.StorageView = &logical.InmemStorage{}
+	storage := conf.StorageView
+
 	b := Backend()
-	if err := b.Setup(context.Background(), &logical.BackendConfig{
-		StorageView: storage,
-		Logger:      logging.NewVaultLogger(log.Trace),
-		System: &logical.StaticSystemView{
-			DefaultLeaseTTLVal: time.Hour,
-			MaxLeaseTTLVal:     24 * time.Hour,
-		},
-	}); err != nil {
+	if err := b.Setup(context.Background(), conf); err != nil {
 		t.Fatalf("backend setup: %v", err)
 	}
 
@@ -4534,7 +4440,7 @@ test are opt-in. cmd/sweep clears debris from crashed runs."
 
 ---
 
-### Task 10: README, examples, and the demo target
+### Task 9: README, examples, and the demo target
 
 Makes the engine presentable. For customer-facing material this is deliverable, not decoration.
 
@@ -4723,14 +4629,14 @@ service-accounts/*."
 
 ## Verification against the spec's success criteria
 
-After Task 10, confirm each criterion from the spec:
+After Task 9, confirm each criterion from the spec:
 
-1. `make dev` yields a working mount against a real account — Task 10, Step 6.
+1. `make dev` yields a working mount against a real account — Task 9, Step 6.
 2. `creds/<name>` returns a key that authenticates — `TestLive_CredentialLifecycle`.
 3. Revoking deletes the key; it then fails to authenticate — `TestLive_CredentialLifecycle`.
 4. `rotate-root` replaces the key, new works, old deleted — `TestLive_RotateRoot`.
 5. At 20 keys, `creds/<name>` fails with the actionable message — `TestLive_KeyCapacity`.
 6. Fast tests pass with no credentials — `make test`.
-7. `make sweep` leaves no `vault-acctest-` resources — Task 9, Step 4.
+7. `make sweep` leaves no `vault-acctest-` resources — Task 8, Step 4.
 
 Criteria 4 and 5 are behind opt-in environment variables because they are destructive or slow. Run both at least once before calling the engine done.
