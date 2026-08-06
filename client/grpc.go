@@ -175,6 +175,26 @@ func (c *grpcClient) DeleteAPIKey(ctx context.Context, id string) error {
 	return awaitOperation(ctx, c.svc, resp.GetAsyncOperation())
 }
 
+// CountAPIKeys counts every key GetApiKeys returns, with no filtering on
+// ApiKey.State.
+//
+// That is only correct if GetApiKeys itself omits keys that no longer occupy
+// one of the 20 slots — i.e. RESOURCE_STATE_EXPIRED and RESOURCE_STATE_DELETED
+// keys. A disabled/suspended key is NOT expired and still occupies a slot, so
+// filtering to RESOURCE_STATE_ACTIVE would undercount and let this engine
+// mint past the real ceiling, trading our actionable error for a raw
+// ResourceExhausted from the server. So if filtering is ever added here, it
+// must exclude only RESOURCE_STATE_EXPIRED/_DELETED and keep every other
+// state, disabled keys included.
+//
+// UNVERIFIED as of Task 8: nobody has confirmed empirically whether
+// GetApiKeys excludes expired keys, because the acceptance test that settles
+// it (TestLive_CountExcludesExpiredKeys in acceptance_test.go) has not yet
+// been run against a live account — see task-8-report.md. Until it has,
+// counting unfiltered (as below) is the deliberately safe choice: it can only
+// overcount, which fails a mint early with our own message, never undercount
+// past the real ceiling. Do not add ACTIVE-only filtering without first
+// running that test.
 func (c *grpcClient) CountAPIKeys(ctx context.Context, serviceAccountID string) (int, error) {
 	count := 0
 	pageToken := ""
