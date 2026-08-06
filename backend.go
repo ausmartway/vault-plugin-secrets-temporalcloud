@@ -62,6 +62,8 @@ func Backend() *backend {
 		Paths: []*framework.Path{
 			b.pathConfig(),
 			b.pathRotateRoot(),
+			b.pathServiceAccounts(),
+			b.pathServiceAccountsList(),
 		},
 		Secrets:    []*framework.Secret{},
 		Invalidate: b.invalidate,

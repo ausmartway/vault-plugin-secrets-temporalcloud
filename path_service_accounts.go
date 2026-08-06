@@ -1,0 +1,378 @@
+package temporalcloud
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
+
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
+)
+
+const (
+	// serviceAccountStoragePrefix is singular while the API path is plural,
+	// following the convention in Vault's own engines.
+	serviceAccountStoragePrefix = "service-account/"
+
+	defaultServiceAccountTTL    = time.Hour
+	defaultServiceAccountMaxTTL = 24 * time.Hour
+
+	// apiKeyExpiryGrace is added to max_ttl when setting a key's Temporal
+	// Cloud expiry, so a key never expires before the lease that owns it.
+	// Task 7 uses this when minting.
+	apiKeyExpiryGrace = 10 * time.Minute
+)
+
+// serviceAccountEntry is a Vault-side service account definition: the Temporal
+// Cloud spec plus the credential policy applied to keys minted from it.
+type serviceAccountEntry struct {
+	// ServiceAccountID is the Temporal Cloud ID, and the only durable link
+	// between this entry and the cloud-side resource.
+	ServiceAccountID string `json:"service_account_id"`
+
+	AccountRole     string            `json:"account_role"`
+	NamespaceAccess map[string]string `json:"namespace_access"`
+	Description     string            `json:"description"`
+
+	TTL    time.Duration `json:"ttl"`
+	MaxTTL time.Duration `json:"max_ttl"`
+}
+
+func serviceAccountStoragePath(name string) string {
+	return serviceAccountStoragePrefix + name
+}
+
+func (b *backend) pathServiceAccounts() *framework.Path {
+	return &framework.Path{
+		Pattern: "service-accounts/" + framework.GenericNameRegex("name"),
+		Fields: map[string]*framework.FieldSchema{
+			"name": {
+				Type:        framework.TypeLowerCaseString,
+				Description: "Name for this service account. Also becomes its name in Temporal Cloud.",
+			},
+			"account_role": {
+				Type:        framework.TypeString,
+				Description: "Account-level role: owner, admin, developer, finance-admin, read, or metrics-read. Required.",
+			},
+			"namespace_access": {
+				Type:        framework.TypeCommaStringSlice,
+				Description: `Namespace permissions as "namespace=permission" pairs, where permission is admin, write, or read. Example: prod.acct1=write,staging.acct1=read`,
+			},
+			"description": {
+				Type:        framework.TypeString,
+				Description: "Description shown in the Temporal Cloud UI.",
+			},
+			"ttl": {
+				Type:        framework.TypeDurationSecond,
+				Description: "Default lease TTL for API keys issued from this service account.",
+			},
+			"max_ttl": {
+				Type:        framework.TypeDurationSecond,
+				Description: "Maximum lease TTL. Also sets the Temporal Cloud expiry on every key minted here.",
+			},
+		},
+		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.CreateOperation: &framework.PathOperation{Callback: b.pathServiceAccountWrite},
+			logical.UpdateOperation: &framework.PathOperation{Callback: b.pathServiceAccountWrite},
+			logical.ReadOperation:   &framework.PathOperation{Callback: b.pathServiceAccountRead},
+			logical.DeleteOperation: &framework.PathOperation{Callback: b.pathServiceAccountDelete},
+		},
+		ExistenceCheck:  b.serviceAccountExists,
+		HelpSynopsis:    "Manage a Temporal Cloud service account.",
+		HelpDescription: pathServiceAccountHelp,
+	}
+}
+
+func (b *backend) pathServiceAccountsList() *framework.Path {
+	return &framework.Path{
+		Pattern: "service-accounts/?$",
+		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.ListOperation: &framework.PathOperation{Callback: b.pathServiceAccountList},
+		},
+		HelpSynopsis: "List Vault-managed Temporal Cloud service accounts.",
+	}
+}
+
+func (b *backend) serviceAccountExists(ctx context.Context, req *logical.Request, d *framework.FieldData) (bool, error) {
+	entry, err := b.getServiceAccount(ctx, req.Storage, d.Get("name").(string))
+	if err != nil {
+		return false, err
+	}
+	return entry != nil, nil
+}
+
+func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	name := d.Get("name").(string)
+
+	existing, err := b.getServiceAccount(ctx, req.Storage, name)
+	if err != nil {
+		return nil, err
+	}
+
+	accountRole := d.Get("account_role").(string)
+	if accountRole == "" {
+		return logical.ErrorResponse("account_role is required"), nil
+	}
+	if _, err := client.ParseAccountRole(accountRole); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+
+	namespaceAccess, err := parseNamespaceAccess(d.Get("namespace_access").([]string))
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
+
+	ttl := time.Duration(d.Get("ttl").(int)) * time.Second
+	maxTTL := time.Duration(d.Get("max_ttl").(int)) * time.Second
+	if ttl == 0 {
+		ttl = defaultServiceAccountTTL
+	}
+	if maxTTL == 0 {
+		maxTTL = defaultServiceAccountMaxTTL
+	}
+	if ttl > maxTTL {
+		return logical.ErrorResponse("ttl of %s exceeds max_ttl of %s", ttl, maxTTL), nil
+	}
+	// Every key minted here expires at max_ttl plus a grace margin, so max_ttl
+	// must leave room under Temporal Cloud's two-year ceiling.
+	if maxTTL+apiKeyExpiryGrace > client.MaxAPIKeyExpiry {
+		return logical.ErrorResponse(
+			"max_ttl of %s exceeds Temporal Cloud's maximum API key expiry of %s "+
+				"(minus a %s grace margin)",
+			maxTTL, client.MaxAPIKeyExpiry, apiKeyExpiryGrace), nil
+	}
+
+	entry := &serviceAccountEntry{
+		AccountRole:     accountRole,
+		NamespaceAccess: namespaceAccess,
+		Description:     d.Get("description").(string),
+		TTL:             ttl,
+		MaxTTL:          maxTTL,
+	}
+	if entry.Description == "" {
+		entry.Description = fmt.Sprintf("Managed by Vault mount %s", req.MountPoint)
+	}
+
+	spec := client.ServiceAccountSpec{
+		Name:            name,
+		Description:     entry.Description,
+		AccountRole:     accountRole,
+		NamespaceAccess: namespaceAccess,
+	}
+
+	c, err := b.getClient(ctx, req.Storage)
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case existing == nil:
+		// New entry: create the service account in Temporal Cloud.
+		id, err := c.CreateServiceAccount(ctx, spec)
+		if err != nil {
+			return nil, fmt.Errorf("creating service account %q in Temporal Cloud: %w", name, err)
+		}
+		entry.ServiceAccountID = id
+
+	default:
+		entry.ServiceAccountID = existing.ServiceAccountID
+
+		// Only call Temporal Cloud if something it knows about changed. TTLs
+		// are a Vault-side concern, so a TTL-only edit needs no API call.
+		if cloudSpecChanged(existing, entry) {
+			if err := c.UpdateServiceAccount(ctx, entry.ServiceAccountID, spec); err != nil {
+				return nil, fmt.Errorf("updating service account %q in Temporal Cloud: %w", name, err)
+			}
+		}
+	}
+
+	storageEntry, err := logical.StorageEntryJSON(serviceAccountStoragePath(name), entry)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := req.Storage.Put(ctx, storageEntry); err != nil {
+		// Temporal Cloud has a service account Vault does not know about.
+		// Compensate so it does not leak, and if that fails too, log the ID
+		// loudly so an operator can clean up by hand.
+		if existing == nil {
+			if delErr := c.DeleteServiceAccount(ctx, entry.ServiceAccountID); delErr != nil {
+				b.Logger().Error(
+					"could not persist the service account and could not delete the "+
+						"one created in Temporal Cloud; delete it by hand",
+					"service_account_id", entry.ServiceAccountID,
+					"name", name,
+					"storage_error", err,
+					"delete_error", delErr)
+			}
+		}
+		return nil, fmt.Errorf("storing service account %q: %w", name, err)
+	}
+
+	return nil, nil
+}
+
+// cloudSpecChanged reports whether anything Temporal Cloud knows about differs.
+func cloudSpecChanged(old, new *serviceAccountEntry) bool {
+	if old.AccountRole != new.AccountRole || old.Description != new.Description {
+		return true
+	}
+	if len(old.NamespaceAccess) != len(new.NamespaceAccess) {
+		return true
+	}
+	for namespace, permission := range new.NamespaceAccess {
+		if old.NamespaceAccess[namespace] != permission {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *backend) pathServiceAccountRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	entry, err := b.getServiceAccount(ctx, req.Storage, d.Get("name").(string))
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, nil
+	}
+
+	namespaceAccess := make([]string, 0, len(entry.NamespaceAccess))
+	for namespace, permission := range entry.NamespaceAccess {
+		namespaceAccess = append(namespaceAccess, namespace+"="+permission)
+	}
+	sort.Strings(namespaceAccess) // stable output
+
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"service_account_id": entry.ServiceAccountID,
+			"account_role":       entry.AccountRole,
+			"namespace_access":   namespaceAccess,
+			"description":        entry.Description,
+			"ttl":                int64(entry.TTL.Seconds()),
+			"max_ttl":            int64(entry.MaxTTL.Seconds()),
+		},
+	}, nil
+}
+
+func (b *backend) pathServiceAccountDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	name := d.Get("name").(string)
+
+	entry, err := b.getServiceAccount(ctx, req.Storage, name)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, nil
+	}
+
+	c, err := b.getClient(ctx, req.Storage)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &logical.Response{}
+
+	if err := c.DeleteServiceAccount(ctx, entry.ServiceAccountID); err != nil {
+		if !errors.Is(err, client.ErrNotFound) {
+			return nil, fmt.Errorf("deleting service account %q from Temporal Cloud: %w", name, err)
+		}
+		// Already gone in Temporal Cloud — someone deleted it out of band.
+		// Removing the Vault entry is still the right outcome.
+		resp.AddWarning(fmt.Sprintf(
+			"service account %q was already absent from Temporal Cloud; removed the Vault entry", name))
+	}
+
+	if err := req.Storage.Delete(ctx, serviceAccountStoragePath(name)); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func (b *backend) pathServiceAccountList(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
+	names, err := req.Storage.List(ctx, serviceAccountStoragePrefix)
+	if err != nil {
+		return nil, err
+	}
+	return logical.ListResponse(names), nil
+}
+
+// getServiceAccount loads an entry, returning nil if it does not exist.
+func (b *backend) getServiceAccount(ctx context.Context, s logical.Storage, name string) (*serviceAccountEntry, error) {
+	if name == "" {
+		return nil, errors.New("service account name must not be empty")
+	}
+
+	raw, err := s.Get(ctx, serviceAccountStoragePath(name))
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		return nil, nil
+	}
+
+	entry := &serviceAccountEntry{}
+	if err := raw.DecodeJSON(entry); err != nil {
+		return nil, fmt.Errorf("decoding service account %q: %w", name, err)
+	}
+	return entry, nil
+}
+
+// parseNamespaceAccess turns "namespace=permission" pairs into a map,
+// rejecting every malformed shape with a message naming the offending entry.
+func parseNamespaceAccess(pairs []string) (map[string]string, error) {
+	access := make(map[string]string, len(pairs))
+
+	for _, pair := range pairs {
+		if strings.TrimSpace(pair) == "" {
+			continue
+		}
+
+		parts := strings.Split(pair, "=")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf(
+				"invalid namespace_access entry %q: expected namespace=permission", pair)
+		}
+
+		namespace := strings.TrimSpace(parts[0])
+		permission := strings.TrimSpace(parts[1])
+
+		if namespace == "" {
+			return nil, fmt.Errorf("invalid namespace_access entry %q: namespace must not be empty", pair)
+		}
+		if permission == "" {
+			return nil, fmt.Errorf("invalid namespace_access entry %q: permission must not be empty", pair)
+		}
+		if _, err := client.ParseNamespacePermission(permission); err != nil {
+			return nil, fmt.Errorf("invalid namespace_access entry %q: %w", pair, err)
+		}
+		if _, seen := access[namespace]; seen {
+			return nil, fmt.Errorf("duplicate namespace %q in namespace_access", namespace)
+		}
+
+		access[namespace] = permission
+	}
+
+	return access, nil
+}
+
+const pathServiceAccountHelp = `
+Defines a Temporal Cloud service account managed by Vault, and the credential
+policy for API keys issued from it.
+
+Writing this path creates the service account in Temporal Cloud; deleting it
+deletes the service account, which invalidates every API key it owns. Changing
+only ttl or max_ttl is a Vault-side change and makes no Temporal Cloud call.
+
+Read credentials for this service account from creds/<name>.
+
+Protect this path with Vault policy. An operator who can write here can create a
+service account with the owner role and then mint keys for it, so write access
+belongs only to platform operators. Applications need read on creds/<name> only.
+`

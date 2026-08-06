@@ -2,7 +2,6 @@ package temporalcloud
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -15,17 +14,23 @@ import (
 // stubCloudOps records calls and returns canned responses. Later tasks extend
 // it; keep the zero value usable so tests only set what they care about.
 type stubCloudOps struct {
-	getServiceAccountFn func(ctx context.Context, id string) (*client.ServiceAccount, error)
-	createAPIKeyFn      func(ctx context.Context, spec client.APIKeySpec) (*client.APIKey, error)
-	deleteAPIKeyFn      func(ctx context.Context, id string) error
-	countAPIKeysFn      func(ctx context.Context, saID string) (int, error)
+	getServiceAccountFn    func(ctx context.Context, id string) (*client.ServiceAccount, error)
+	createServiceAccountFn func(ctx context.Context, spec client.ServiceAccountSpec) (string, error)
+	updateServiceAccountFn func(ctx context.Context, id string, spec client.ServiceAccountSpec) error
+	deleteServiceAccountFn func(ctx context.Context, id string) error
+	createAPIKeyFn         func(ctx context.Context, spec client.APIKeySpec) (*client.APIKey, error)
+	deleteAPIKeyFn         func(ctx context.Context, id string) error
+	countAPIKeysFn         func(ctx context.Context, saID string) (int, error)
 
 	deletedAPIKeys []string
 	closed         bool
 }
 
-func (s *stubCloudOps) CreateServiceAccount(context.Context, client.ServiceAccountSpec) (string, error) {
-	return "", errors.New("not implemented in this stub")
+func (s *stubCloudOps) CreateServiceAccount(ctx context.Context, spec client.ServiceAccountSpec) (string, error) {
+	if s.createServiceAccountFn != nil {
+		return s.createServiceAccountFn(ctx, spec)
+	}
+	return "sa-stub", nil
 }
 
 func (s *stubCloudOps) GetServiceAccount(ctx context.Context, id string) (*client.ServiceAccount, error) {
@@ -35,12 +40,18 @@ func (s *stubCloudOps) GetServiceAccount(ctx context.Context, id string) (*clien
 	return &client.ServiceAccount{ID: id}, nil
 }
 
-func (s *stubCloudOps) UpdateServiceAccount(context.Context, string, client.ServiceAccountSpec) error {
-	return errors.New("not implemented in this stub")
+func (s *stubCloudOps) UpdateServiceAccount(ctx context.Context, id string, spec client.ServiceAccountSpec) error {
+	if s.updateServiceAccountFn != nil {
+		return s.updateServiceAccountFn(ctx, id, spec)
+	}
+	return nil
 }
 
-func (s *stubCloudOps) DeleteServiceAccount(context.Context, string) error {
-	return errors.New("not implemented in this stub")
+func (s *stubCloudOps) DeleteServiceAccount(ctx context.Context, id string) error {
+	if s.deleteServiceAccountFn != nil {
+		return s.deleteServiceAccountFn(ctx, id)
+	}
+	return nil
 }
 
 func (s *stubCloudOps) CreateAPIKey(ctx context.Context, spec client.APIKeySpec) (*client.APIKey, error) {
