@@ -26,6 +26,10 @@ test-live:
 sweep:
 	go run ./cmd/sweep
 
+## dev: build the plugin and run Vault in dev mode with it mounted
+dev:
+	@./scripts/dev.sh
+
 fmt:
 	gofmt -w .
 

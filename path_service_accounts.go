@@ -24,7 +24,6 @@ const (
 
 	// apiKeyExpiryGrace is added to max_ttl when setting a key's Temporal
 	// Cloud expiry, so a key never expires before the lease that owns it.
-	// Task 7 uses this when minting.
 	apiKeyExpiryGrace = 10 * time.Minute
 )
 
