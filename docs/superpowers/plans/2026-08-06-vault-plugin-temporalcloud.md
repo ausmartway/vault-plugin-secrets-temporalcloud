@@ -4597,6 +4597,9 @@ It must cover, in this order: the problem, quick start, every path with examples
 - **The problem** — Temporal Cloud API keys are shown once, must expire (2y max), rotate manually in four steps, and have no lifecycle tie to the workload holding them. Vault dynamic secrets solve exactly this.
 - **Quick start** — `make dev`, then the seven steps from `examples/demo.sh`.
 - **Paths** — `config`, `config/rotate-root`, `service-accounts/<name>`, `creds/<name>`, with the field tables from the spec and a worked example each.
+- **Write semantics on `service-accounts/<name>`** — a short section of its own, because two behaviours here surprise people and both change live state in Temporal Cloud:
+  - Creating requires the full spec. Updating **merges**: a field you omit keeps its stored value, and passing `namespace_access=""` explicitly is how you clear all namespace permissions — which does revoke them in Temporal Cloud.
+  - Creating a name that already exists in Temporal Cloud **fails** unless you pass `force=true`, which adopts that account and resets its permissions to your spec. An adopted account is then **fully Vault-managed: `vault delete` on the entry deletes the service account in Temporal Cloud**, exactly as for one Vault created itself. Say this plainly — an operator adopting a colleague's service account must know Vault can now destroy it.
 - **The 20-key ceiling** — a callout, not a footnote:
   > Temporal Cloud allows 20 non-expired API keys per service account, so at most **20 concurrent leases** per `service-accounts/<name>` entry. Revoking a lease frees a slot immediately; letting it expire does too. If you need more concurrent consumers, create more service accounts.
 - **Root key expiry** — a warning callout:
