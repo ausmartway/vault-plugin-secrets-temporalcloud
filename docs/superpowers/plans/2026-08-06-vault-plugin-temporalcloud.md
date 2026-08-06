@@ -100,13 +100,15 @@ The file already exists with a `.superpowers/` entry. Append to it; do not overw
 ```gitignore
 # Build output
 /bin/
-vault-plugin-secrets-temporalcloud
+/vault-plugin-secrets-temporalcloud
 
 # Credentials — never commit these
 .env
 *.pem
 *.key
 ```
+
+The leading slash on `/vault-plugin-secrets-temporalcloud` is load-bearing. Unanchored, that pattern matches at any depth and would exclude the source directory `cmd/vault-plugin-secrets-temporalcloud/`, silently dropping `main.go` from every commit. Confirm with `git check-ignore -v cmd/vault-plugin-secrets-temporalcloud/main.go` — it must report no match.
 
 - [ ] **Step 3: Write the failing tests**
 
