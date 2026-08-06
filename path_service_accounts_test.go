@@ -218,6 +218,50 @@ func TestServiceAccounts_CompensatesWhenStorageFails(t *testing.T) {
 	}
 }
 
+// If adoption succeeds (Temporal Cloud already updated) but the Vault storage
+// write then fails, the compensating delete must NOT run: Vault did not
+// create this account, so it has no right to delete it just because its own
+// storage write failed. This is the guard that distinguishes the adopted
+// branch from the created branch above.
+func TestServiceAccounts_DoesNotCompensateWhenAdoptedAndStorageFails(t *testing.T) {
+	b, _ := newTestBackend(t)
+
+	deleteCalled := false
+	stub := &stubCloudOps{}
+	stub.findServiceAccountByNameFn = func(_ context.Context, name string) (*client.ServiceAccount, error) {
+		return &client.ServiceAccount{ID: "sa-existing"}, nil
+	}
+	stub.deleteServiceAccountFn = func(_ context.Context, id string) error {
+		deleteCalled = true
+		return nil
+	}
+	withStubClient(b, stub)
+
+	// A storage view that accepts the config write but fails the service
+	// account write, so we exercise exactly the compensation path.
+	storage := &failingStorage{
+		Storage:      &logical.InmemStorage{},
+		failOnPrefix: "service-account/",
+	}
+	mustWriteConfig(t, b, storage)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/doomed",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role": "read",
+			"force":        true,
+		},
+	})
+	if err == nil && (resp == nil || !resp.IsError()) {
+		t.Fatal("expected the adopt to fail when storage fails")
+	}
+	if deleteCalled {
+		t.Error("expected DeleteServiceAccount not to be called for an adopted account")
+	}
+}
+
 // Temporal Cloud requires service-account names to be unique. Creating a name
 // that already exists there must be refused, name the colliding account's ID,
 // and never call CreateServiceAccount or persist anything.

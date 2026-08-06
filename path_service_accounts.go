@@ -86,9 +86,9 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 			"force": {
 				Type: framework.TypeBool,
 				Description: "If a service account with this name already exists in Temporal Cloud, adopt it and " +
-					"reset its permissions to this specification instead of failing. Adopting makes the account " +
-					"fully Vault-managed: deleting this entry afterward deletes it in Temporal Cloud, exactly as " +
-					"for one Vault created itself. Ignored when updating an entry Vault already manages.",
+					"reset its permissions to this specification instead of failing. Adoption makes the account " +
+					"fully Vault-managed, exactly as if Vault had created it: deleting this entry afterward " +
+					"deletes it in Temporal Cloud too. Ignored when updating an entry Vault already manages.",
 			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
