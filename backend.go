@@ -6,6 +6,7 @@ package temporalcloud
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 
@@ -57,8 +58,10 @@ func Backend() *backend {
 			// The root API key lives here, so it must be seal-wrapped.
 			SealWrapStorage: []string{configStoragePath},
 		},
-		// Paths and Secrets are appended by later tasks.
-		Paths:      []*framework.Path{},
+		// Secrets is appended by later tasks.
+		Paths: []*framework.Path{
+			b.pathConfig(),
+		},
 		Secrets:    []*framework.Secret{},
 		Invalidate: b.invalidate,
 		Clean:      b.clean,
@@ -93,6 +96,47 @@ func (b *backend) resetClient() {
 		b.client = nil
 	}
 }
+
+// getClient returns the cached Cloud Ops client, building it from stored
+// config on first use. The gRPC connection is expensive to establish, so it is
+// shared across requests and rebuilt only when config changes.
+func (b *backend) getClient(ctx context.Context, s logical.Storage) (client.CloudOps, error) {
+	b.clientMu.RLock()
+	if b.client != nil {
+		defer b.clientMu.RUnlock()
+		return b.client, nil
+	}
+	b.clientMu.RUnlock()
+
+	b.clientMu.Lock()
+	defer b.clientMu.Unlock()
+
+	// Another goroutine may have built it while we waited for the write lock.
+	if b.client != nil {
+		return b.client, nil
+	}
+
+	cfg, err := b.getConfig(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, errBackendNotConfigured
+	}
+
+	c, err := b.newClient(cfg.clientConfig())
+	if err != nil {
+		return nil, err
+	}
+
+	b.client = c
+	return c, nil
+}
+
+// errBackendNotConfigured is returned when a path needs Temporal Cloud but the
+// config path has not been written.
+var errBackendNotConfigured = errors.New(
+	"the Temporal Cloud secrets engine is not configured; write the config path first")
 
 const backendHelp = `
 The Temporal Cloud secrets engine provisions Temporal Cloud service accounts and
