@@ -1,2 +1,11 @@
 # Subagent-driven-development scratch workspace (ledgers, briefs, review packages)
 .superpowers/
+
+# Build output
+/bin/
+/vault-plugin-secrets-temporalcloud
+
+# Credentials — never commit these
+.env
+*.pem
+*.key
