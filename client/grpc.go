@@ -154,6 +154,16 @@ func (c *grpcClient) CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey
 	return &APIKey{ID: resp.GetKeyId(), Token: resp.GetToken()}, nil
 }
 
+// DeleteAPIKey deliberately omits ResourceVersion, unlike UpdateServiceAccount
+// and DeleteServiceAccount above. KeyId already identifies exactly one key;
+// ResourceVersion only describes what state that key is in, so leaving it out
+// can't target the wrong key. API keys do mutate (see UpdateApiKey — Disabled,
+// DisplayName, Description, and ExpiryTime can all change and bump the
+// version), and the most likely mutation is an admin disabling a key they
+// suspect is compromised. Making revocation conditional on the version would
+// let that disable race ahead and make the delete fail, leaving the Vault
+// lease unable to revoke a credential it issued. Failing to revoke is worse
+// than clobbering a concurrent edit, so this call stays unconditional.
 func (c *grpcClient) DeleteAPIKey(ctx context.Context, id string) error {
 	resp, err := c.svc.DeleteApiKey(ctx, &cloudservicev1.DeleteApiKeyRequest{
 		KeyId: id,
@@ -184,10 +194,18 @@ func (c *grpcClient) CountAPIKeys(ctx context.Context, serviceAccountID string) 
 
 		count += len(resp.GetApiKeys())
 
-		pageToken = resp.GetNextPageToken()
-		if pageToken == "" {
+		nextPageToken := resp.GetNextPageToken()
+		if nextPageToken == "" {
 			return count, nil
 		}
+		// A misbehaving server could return the same token forever, spinning
+		// this loop on the credential-issuing path with no bound but context
+		// cancellation. Fail loudly rather than risk an undercount that lets
+		// a mint slip past the 20-key ceiling.
+		if nextPageToken == pageToken {
+			return 0, fmt.Errorf("%w: GetApiKeys page token did not advance", ErrUnavailable)
+		}
+		pageToken = nextPageToken
 	}
 }
 
