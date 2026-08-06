@@ -9,7 +9,7 @@ import (
 	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/sdk/plugin"
 
-	temporalcloud "github.com/temporal-sa/vault-plugin-temporalcloud"
+	temporalcloud "github.com/ausmartway/vault-plugin-secrets-temporalcloud"
 )
 
 func main() {

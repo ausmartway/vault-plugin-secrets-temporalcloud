@@ -12,7 +12,7 @@ import (
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 // configStoragePath is the storage key holding the engine's configuration.

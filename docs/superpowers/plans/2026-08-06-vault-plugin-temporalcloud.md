@@ -14,7 +14,7 @@
 
 Every task's requirements implicitly include this section.
 
-- **Module path:** `github.com/temporal-sa/vault-plugin-temporalcloud`. Go directive `go 1.26`.
+- **Module path:** `github.com/ausmartway/vault-plugin-secrets-temporalcloud`. Go directive `go 1.26`.
 - **Package name:** `temporalcloud` at the repo root; `client` in `client/`.
 - **Cloud Ops Go client is `go.temporal.io/cloud-sdk` v0.16.0, package `cloudclient`.** Not `go.temporal.io/api` (it has no `cloud/` package) and not `github.com/temporalio/cloud-api` (protos only, no Go code). Getting this wrong wastes an hour. Both dependency versions below are the current releases as of 2026-08-06 — pin them exactly; do not use `@latest`, which drifts.
 - **Terminal async success state is `AsyncOperation_STATE_FULFILLED`.** There is no `SUCCEEDED`. `FAILED`, `CANCELLED`, `REJECTED` are terminal errors.
@@ -80,7 +80,7 @@ Note there is deliberately **no `newClient` field on `backend` in this task**. I
 
 ```bash
 cd /Users/yuleiliu/repos/vault-plugin-temporalcloud
-go mod init github.com/temporal-sa/vault-plugin-temporalcloud
+go mod init github.com/ausmartway/vault-plugin-secrets-temporalcloud
 go get github.com/hashicorp/vault/sdk@v0.25.1
 go get go.temporal.io/cloud-sdk@v0.16.0
 ```
@@ -424,7 +424,7 @@ import (
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 // configStoragePath is the storage key holding the engine's configuration.
@@ -525,7 +525,7 @@ import (
 	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/sdk/plugin"
 
-	temporalcloud "github.com/temporal-sa/vault-plugin-temporalcloud"
+	temporalcloud "github.com/ausmartway/vault-plugin-secrets-temporalcloud"
 )
 
 func main() {
@@ -1498,7 +1498,7 @@ import (
 
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 // stubCloudOps records calls and returns canned responses. Later tasks extend
@@ -1772,7 +1772,7 @@ import (
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 const (
@@ -2111,7 +2111,7 @@ import (
 
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 func TestRotateRoot_ReplacesCredential(t *testing.T) {
@@ -2310,7 +2310,7 @@ import (
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 func (b *backend) pathRotateRoot() *framework.Path {
@@ -2494,7 +2494,7 @@ import (
 
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 func TestParseNamespaceAccess(t *testing.T) {
@@ -2918,7 +2918,7 @@ import (
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 const (
@@ -3350,7 +3350,7 @@ import (
 
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 // The cap check is where a confusing failure would otherwise surface, so it is
@@ -3650,7 +3650,7 @@ import (
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 func (b *backend) pathCreds() *framework.Path {
@@ -3794,7 +3794,7 @@ import (
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 // secretTypeAPIKey identifies leases issued by this engine.
@@ -3968,7 +3968,7 @@ import (
 
 	"github.com/hashicorp/vault/sdk/logical"
 
-	"github.com/temporal-sa/vault-plugin-temporalcloud/client"
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 // acctestPrefix names every resource these tests create, so anything left

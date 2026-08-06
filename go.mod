@@ -1,4 +1,4 @@
-module github.com/temporal-sa/vault-plugin-temporalcloud
+module github.com/ausmartway/vault-plugin-secrets-temporalcloud
 
 go 1.26
 

@@ -117,7 +117,7 @@ vault-plugin-temporalcloud/
     └── errors.go             gRPC status → Vault error mapping
 ```
 
-Module path: `github.com/temporal-sa/vault-plugin-temporalcloud`. Go 1.26.
+Module path: `github.com/ausmartway/vault-plugin-secrets-temporalcloud`. Go 1.26.
 
 Dependencies, both current as of 2026-08-06: `go.temporal.io/cloud-sdk` v0.16.0 (Cloud Ops client and
 generated protos, bundling Cloud Ops API version v0.19.1) and `github.com/hashicorp/vault/sdk` v0.25.1
