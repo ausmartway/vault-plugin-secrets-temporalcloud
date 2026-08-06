@@ -45,7 +45,7 @@ Verified against Temporal documentation before designing. These drive several de
 | Fact | Consequence for this design |
 | --- | --- |
 | Cloud Ops API: gRPC `saas-api.tmprl.cloud:443`, HTTP `https://saas-api.tmprl.cloud` | Use gRPC via `go.temporal.io/cloud-sdk` |
-| The Go client lives in `go.temporal.io/cloud-sdk` v0.14.1, package `cloudclient` — **not** in `go.temporal.io/api`, which has no `cloud/` package at all. `github.com/temporalio/cloud-api` is protos-only with no Go code. | Correct dependency; verified by inspecting the module |
+| The Go client lives in `go.temporal.io/cloud-sdk` v0.16.0, package `cloudclient` — **not** in `go.temporal.io/api`, which has no `cloud/` package at all. `github.com/temporalio/cloud-api` is protos-only with no Go code. | Correct dependency; verified by inspecting the module |
 | All mutations are **async** — return an operation ID to poll | A polling layer hides this from all callers |
 | Terminal async states are `FULFILLED` (success), `FAILED`, `CANCELLED`, `REJECTED` — there is no `SUCCEEDED` | Poll until `FULFILLED`; treat the other three as errors |
 | `CreateApiKeyResponse` carries `KeyId` and `Token` directly on the response | Token is available without a follow-up read |
@@ -119,8 +119,9 @@ vault-plugin-temporalcloud/
 
 Module path: `github.com/temporal-sa/vault-plugin-temporalcloud`. Go 1.26.
 
-Dependencies: `go.temporal.io/cloud-sdk` v0.14.1 (Cloud Ops client and generated protos) and
-`github.com/hashicorp/vault/sdk` v0.25.1 (plugin framework).
+Dependencies, both current as of 2026-08-06: `go.temporal.io/cloud-sdk` v0.16.0 (Cloud Ops client and
+generated protos, bundling Cloud Ops API version v0.19.1) and `github.com/hashicorp/vault/sdk` v0.25.1
+(plugin framework).
 
 `client.CloudOps` is the boundary between Vault logic and Temporal Cloud. Everything above it is
 plain Vault path handling and never mentions gRPC or async operations; everything below it never
