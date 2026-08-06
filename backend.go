@@ -58,14 +58,16 @@ func Backend() *backend {
 			// The root API key lives here, so it must be seal-wrapped.
 			SealWrapStorage: []string{configStoragePath},
 		},
-		// Secrets is appended by later tasks.
 		Paths: []*framework.Path{
 			b.pathConfig(),
 			b.pathRotateRoot(),
 			b.pathServiceAccounts(),
 			b.pathServiceAccountsList(),
+			b.pathCreds(),
 		},
-		Secrets:    []*framework.Secret{},
+		Secrets: []*framework.Secret{
+			b.secretAPIKey(),
+		},
 		Invalidate: b.invalidate,
 		Clean:      b.clean,
 	}
