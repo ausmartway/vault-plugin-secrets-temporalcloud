@@ -80,8 +80,12 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 				Description: "Default lease TTL for API keys issued from this service account.",
 			},
 			"max_ttl": {
-				Type:        framework.TypeDurationSecond,
-				Description: "Maximum lease TTL. Also sets the Temporal Cloud expiry on every key minted here.",
+				Type: framework.TypeDurationSecond,
+				Description: "Maximum lease TTL. Also sets the Temporal Cloud expiry on every key minted " +
+					"here (max_ttl plus a short grace margin). Temporal Cloud will not accept an expiry less " +
+					"than 24 hours out, so a max_ttl below that is floored up to 24 hours for the purpose of " +
+					"the Temporal Cloud expiry only — the key is still deleted when its lease ends, so a " +
+					"short max_ttl still means a short-lived credential in practice.",
 			},
 			"force": {
 				Type: framework.TypeBool,
@@ -190,7 +194,11 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 		return logical.ErrorResponse("ttl of %s exceeds max_ttl of %s", ttl, maxTTL), nil
 	}
 	// Every key minted here expires at max_ttl plus a grace margin, so max_ttl
-	// must leave room under Temporal Cloud's two-year ceiling.
+	// must leave room under Temporal Cloud's two-year ceiling. There is no
+	// matching floor check: a max_ttl below Temporal Cloud's undocumented
+	// 24-hour minimum is legal here and rejects nothing, because path_creds.go
+	// floors the Temporal Cloud expiry up to that minimum at mint time rather
+	// than sending max_ttl's true value and having Temporal Cloud reject it.
 	if maxTTL+apiKeyExpiryGrace > client.MaxAPIKeyExpiry {
 		return logical.ErrorResponse(
 			"max_ttl of %s exceeds Temporal Cloud's maximum API key expiry of %s "+

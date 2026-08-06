@@ -360,92 +360,30 @@ func TestLive_KeyCapacity(t *testing.T) {
 	}
 }
 
-// TestLive_CountExcludesExpiredKeys settles the assumption behind
+// TestLive_CountExcludesExpiredKeys was meant to settle the assumption behind
 // CountAPIKeys (see the comment there): that Temporal Cloud's GetApiKeys
 // response omits keys that no longer occupy one of the 20 slots, so counting
 // every returned key without filtering is correct rather than an ever-growing
 // overcount.
 //
-// It mints a key with the shortest expiry Temporal Cloud accepts on a
-// dedicated service account, counts before and after minting, then polls
-// CountAPIKeys until the key's expiry has passed to see whether the count
-// drops back down on its own.
+// It cannot do that anymore. The original approach minted a key with a
+// 2-minute expiry (bypassing creds/<name>, straight against the client, so
+// the expiry would not be clamped to the service account's max_ttl) and
+// polled CountAPIKeys until that expiry passed. Live testing found Temporal
+// Cloud rejects any expiry less than 24 hours from now (see
+// client.MinAPIKeyExpiry) — undocumented, discovered by this project's own
+// task-7 mint failures. A 2-minute expiry is no longer mintable at all, and
+// waiting out a real 24-hour expiry is not something a test suite should do
+// (this run has a 20-minute timeout).
+//
+// So the question CountAPIKeys' no-filter design depends on — does
+// GetApiKeys omit keys that have expired but not yet been deleted? — is
+// still open. It cannot be settled within a reasonable test run now that the
+// minimum expiry is a day. Skip rather than fabricate a pass.
 func TestLive_CountExcludesExpiredKeys(t *testing.T) {
-	b, storage := liveBackend(t)
-	name := acctestName(t)
-
-	createServiceAccount(t, b, storage, name, map[string]interface{}{
-		"account_role": "read",
-		"ttl":          "10m",
-		"max_ttl":      "1h",
-	})
-
-	resp, err := b.HandleRequest(context.Background(), &logical.Request{
-		Operation: logical.ReadOperation,
-		Path:      "service-accounts/" + name,
-		Storage:   storage,
-	})
-	if err != nil || resp == nil || resp.IsError() {
-		t.Fatalf("read: err=%v resp=%v", err, resp)
-	}
-	saID, _ := resp.Data["service_account_id"].(string)
-	if saID == "" {
-		t.Fatal("expected a Temporal Cloud service account ID")
-	}
-
-	c, err := b.getClient(context.Background(), storage)
-	if err != nil {
-		t.Fatalf("get client: %v", err)
-	}
-
-	before, err := c.CountAPIKeys(context.Background(), saID)
-	if err != nil {
-		t.Fatalf("count before minting: %v", err)
-	}
-
-	// Mint directly against the client, bypassing creds/<name>, so the key's
-	// expiry is not clamped to this service account's max_ttl.
-	const shortExpiry = 2 * time.Minute
-	key, err := c.CreateAPIKey(context.Background(), client.APIKeySpec{
-		ServiceAccountID: saID,
-		DisplayName:      acctestName(t),
-		Description:      "short-lived key for TestLive_CountExcludesExpiredKeys",
-		ExpiryTime:       time.Now().Add(shortExpiry),
-	})
-	if err != nil {
-		t.Fatalf("mint short-lived key: %v", err)
-	}
-	// Delete is best-effort: once the key expires, Temporal Cloud may already
-	// consider it gone.
-	t.Cleanup(func() {
-		_ = c.DeleteAPIKey(context.Background(), key.ID)
-	})
-
-	afterMint, err := c.CountAPIKeys(context.Background(), saID)
-	if err != nil {
-		t.Fatalf("count after minting: %v", err)
-	}
-	if afterMint != before+1 {
-		t.Fatalf("expected the count to rise by exactly one after minting, got %d -> %d", before, afterMint)
-	}
-
-	t.Logf("waiting for the key to expire (expiry set to %s from now)...", shortExpiry)
-	deadline := time.Now().Add(shortExpiry + 3*time.Minute)
-	for {
-		n, err := c.CountAPIKeys(context.Background(), saID)
-		if err != nil {
-			t.Fatalf("count while waiting for expiry: %v", err)
-		}
-		if n == before {
-			t.Logf("expired key dropped out of CountAPIKeys on its own: count is back to %d", n)
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("GetApiKeys still counts the expired key after waiting past its expiry: "+
-				"count is %d, expected it to fall back to %d. CountAPIKeys' no-filter design "+
-				"assumes the API excludes expired keys; this proves it does not, so "+
-				"CountAPIKeys needs to filter out RESOURCE_STATE_EXPIRED (and _DELETED) itself.", n, before)
-		}
-		time.Sleep(10 * time.Second)
-	}
+	t.Skip("cannot settle whether GetApiKeys excludes expired-but-undeleted keys: " +
+		"Temporal Cloud's undocumented 24-hour minimum expiry (client.MinAPIKeyExpiry) " +
+		"means a key can no longer be minted short-lived enough to expire within a " +
+		"reasonable test timeout. The question CountAPIKeys' no-filter design relies on " +
+		"remains open; see the comment on CountAPIKeys and on this test.")
 }

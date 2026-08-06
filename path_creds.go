@@ -61,8 +61,25 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 	// The Temporal Cloud expiry covers max_ttl plus a grace margin rather than
 	// ttl. A key expiring at ttl would die under a renewed lease; covering
 	// max_ttl means renewal never needs a Cloud Ops call, and a key orphaned
-	// by a Vault failure still self-destructs within one maximum lifetime.
-	expiry := time.Now().Add(entry.MaxTTL + apiKeyExpiryGrace)
+	// by a Vault failure still self-destructs within one maximum lifetime —
+	// or, below, within client.MinAPIKeyExpiry.
+	//
+	// Temporal Cloud rejects any expiry less than client.MinAPIKeyExpiry from
+	// now (undocumented; found by live testing), so a short max_ttl is
+	// floored up to that minimum here rather than sent as-is and rejected.
+	// This does not weaken credential lifetime: the key is deleted when its
+	// lease ends regardless of its nominal Temporal Cloud expiry, so a
+	// 15-minute max_ttl still means the key is gone in 15 minutes in the
+	// normal case. What the floor actually widens is the fallback window —
+	// the time an orphaned key (one Vault never got to revoke, because Vault
+	// crashed, lost storage, or the mount was deleted) stays alive before it
+	// self-destructs on its own. That window was one max_ttl; with the floor
+	// it is now at least client.MinAPIKeyExpiry, i.e. at least a day.
+	keyLifetime := entry.MaxTTL + apiKeyExpiryGrace
+	if floor := client.MinAPIKeyExpiry + apiKeyExpiryGrace; keyLifetime < floor {
+		keyLifetime = floor
+	}
+	expiry := time.Now().Add(keyLifetime)
 
 	key, err := c.CreateAPIKey(ctx, client.APIKeySpec{
 		ServiceAccountID: entry.ServiceAccountID,
@@ -138,4 +155,14 @@ return it again. Read this path again for a new one.
 Temporal Cloud permits 20 non-expired API keys per service account, so at most
 20 leases can be outstanding against one service-accounts/<name> entry at a
 time. Revoking a lease frees a slot immediately.
+
+Temporal Cloud will not accept an API key expiry less than 24 hours from now
+(undocumented by Temporal Cloud). If the service account's max_ttl is shorter
+than that, this engine automatically floors the key's Temporal Cloud expiry at
+24 hours so the mint still succeeds — it does not require you to raise
+max_ttl. This only widens the fallback: if Vault never gets to revoke the key
+(a crash, lost storage, or a deleted mount), the key self-destructs at that
+floored expiry instead of at max_ttl. In the normal case the key is still
+deleted the moment its lease ends, so a short max_ttl still means a
+short-lived credential.
 `

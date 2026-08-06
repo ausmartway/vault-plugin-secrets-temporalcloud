@@ -106,3 +106,10 @@ const MaxAPIKeysPerServiceAccount = 20
 // MaxAPIKeyExpiry is the furthest out Temporal Cloud will accept an API key
 // expiry time.
 const MaxAPIKeyExpiry = 2 * 365 * 24 * time.Hour
+
+// MinAPIKeyExpiry is the closest in Temporal Cloud will accept an API key
+// expiry time. It is undocumented — found empirically via live testing, which
+// hit "invalid argument: expiry must be after ... (24h0m0s from now)" when
+// minting a key with a short max_ttl. The engine floors a key's expiry at
+// this minimum so mint requests succeed regardless of max_ttl.
+const MinAPIKeyExpiry = 24 * time.Hour

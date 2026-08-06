@@ -71,7 +71,7 @@ func TestCreds_MintsKeyAndIssuesLease(t *testing.T) {
 	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
 		"account_role": "developer",
 		"ttl":          "1h",
-		"max_ttl":      "8h",
+		"max_ttl":      "48h",
 	})
 
 	resp, err := b.HandleRequest(context.Background(), &logical.Request{
@@ -99,8 +99,8 @@ func TestCreds_MintsKeyAndIssuesLease(t *testing.T) {
 	if resp.Secret.TTL != time.Hour {
 		t.Errorf("expected a 1h lease, got %v", resp.Secret.TTL)
 	}
-	if resp.Secret.MaxTTL != 8*time.Hour {
-		t.Errorf("expected an 8h max TTL, got %v", resp.Secret.MaxTTL)
+	if resp.Secret.MaxTTL != 48*time.Hour {
+		t.Errorf("expected a 48h max TTL, got %v", resp.Secret.MaxTTL)
 	}
 
 	// The key ID must be in internal data so revocation can find it, and the
@@ -112,14 +112,102 @@ func TestCreds_MintsKeyAndIssuesLease(t *testing.T) {
 		t.Error("the token must never be stored in lease internal data")
 	}
 
-	// The Temporal Cloud expiry must cover max_ttl plus grace, not just ttl:
-	// otherwise a renewed lease would outlive its own key.
-	wantExpiry := time.Now().Add(8*time.Hour + apiKeyExpiryGrace)
+	// max_ttl (48h) is already above the 24h floor, so the Temporal Cloud
+	// expiry must cover max_ttl plus grace unclamped, not just ttl: otherwise
+	// a renewed lease would outlive its own key.
+	wantExpiry := time.Now().Add(48*time.Hour + apiKeyExpiryGrace)
 	if delta := gotSpec.ExpiryTime.Sub(wantExpiry); delta > time.Minute || delta < -time.Minute {
 		t.Errorf("expected an expiry near %v (max_ttl + grace), got %v", wantExpiry, gotSpec.ExpiryTime)
 	}
 	if gotSpec.ServiceAccountID != "sa-1" {
 		t.Errorf("expected the key to be minted on sa-1, got %q", gotSpec.ServiceAccountID)
+	}
+}
+
+// TestCreds_ShortMaxTTLFloorsExpiryAtMinimum verifies that a max_ttl below
+// Temporal Cloud's undocumented 24-hour minimum still produces a mintable
+// expiry: the engine floors it at 24h+grace instead of sending max_ttl+grace
+// (~1h10m) and having Temporal Cloud reject it.
+func TestCreds_ShortMaxTTLFloorsExpiryAtMinimum(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	var gotSpec client.APIKeySpec
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	stub.createAPIKeyFn = func(_ context.Context, spec client.APIKeySpec) (*client.APIKey, error) {
+		gotSpec = spec
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+		"ttl":          "30m",
+		"max_ttl":      "1h",
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read creds: err=%v resp=%v", err, resp)
+	}
+
+	// Expect ~24h10m out (client.MinAPIKeyExpiry + grace), NOT ~1h10m
+	// (max_ttl + grace).
+	wantExpiry := time.Now().Add(client.MinAPIKeyExpiry + apiKeyExpiryGrace)
+	if delta := gotSpec.ExpiryTime.Sub(wantExpiry); delta > time.Minute || delta < -time.Minute {
+		t.Errorf("expected the expiry floored near %v (24h10m out), got %v", wantExpiry, gotSpec.ExpiryTime)
+	}
+
+	// The lease itself must still honor the operator's short max_ttl: the
+	// floor only affects the Temporal Cloud expiry sent to CreateAPIKey.
+	if resp.Secret.MaxTTL != time.Hour {
+		t.Errorf("expected the lease's max TTL to stay at the configured 1h, got %v", resp.Secret.MaxTTL)
+	}
+}
+
+// TestCreds_LongMaxTTLIsNotClamped verifies that the floor only raises
+// expiries that would otherwise fall under the minimum — a max_ttl already
+// above it passes through unchanged (max_ttl + grace), matching
+// TestCreds_MintsKeyAndIssuesLease's assertion but stated as its own
+// boundary case.
+func TestCreds_LongMaxTTLIsNotClamped(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	var gotSpec client.APIKeySpec
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	stub.createAPIKeyFn = func(_ context.Context, spec client.APIKeySpec) (*client.APIKey, error) {
+		gotSpec = spec
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+		"ttl":          "1h",
+		"max_ttl":      "48h",
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read creds: err=%v resp=%v", err, resp)
+	}
+
+	wantExpiry := time.Now().Add(48*time.Hour + apiKeyExpiryGrace)
+	if delta := gotSpec.ExpiryTime.Sub(wantExpiry); delta > time.Minute || delta < -time.Minute {
+		t.Errorf("expected the floor to leave a 48h max_ttl unclamped, near %v, got %v", wantExpiry, gotSpec.ExpiryTime)
 	}
 }
 
