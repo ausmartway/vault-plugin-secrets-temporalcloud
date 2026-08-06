@@ -61,7 +61,7 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 			},
 			"namespace_access": {
 				Type:        framework.TypeCommaStringSlice,
-				Description: `Namespace permissions as "namespace=permission" pairs, where permission is admin, write, or read. Example: prod.acct1=write,staging.acct1=read`,
+				Description: `Namespace permissions as "namespace=permission" pairs, where permission is admin, write, or read. Example: prod.acct1=write,staging.acct1=read. On update, omit this field to leave existing namespace permissions untouched; pass an empty string to deliberately clear all of them (this reaches Temporal Cloud).`,
 			},
 			"description": {
 				Type:        framework.TypeString,
@@ -122,19 +122,50 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 		return logical.ErrorResponse(err.Error()), nil
 	}
 
-	namespaceAccess, err := parseNamespaceAccess(d.Get("namespace_access").([]string))
-	if err != nil {
-		return logical.ErrorResponse(err.Error()), nil
+	// namespace_access, ttl, max_ttl, and description merge against the stored
+	// entry on update: an operator who omits a field means "leave it alone,"
+	// not "reset it." d.GetOk reports whether the key was present in the
+	// request at all, which is the only way to tell "omitted" from
+	// "explicitly set to the zero value" (e.g. namespace_access="" to
+	// deliberately clear it). account_role is exempt — it stays required on
+	// every write. On create there is no stored entry to fall back to, so
+	// every field behaves exactly as before: absent means default.
+	_, namespaceAccessSet := d.GetOk("namespace_access")
+	_, ttlSet := d.GetOk("ttl")
+	_, maxTTLSet := d.GetOk("max_ttl")
+	_, descriptionSet := d.GetOk("description")
+
+	var namespaceAccess map[string]string
+	var ttl, maxTTL time.Duration
+	var description string
+
+	if existing != nil && !namespaceAccessSet {
+		namespaceAccess = existing.NamespaceAccess
+	} else {
+		namespaceAccess, err = parseNamespaceAccess(d.Get("namespace_access").([]string))
+		if err != nil {
+			return logical.ErrorResponse(err.Error()), nil
+		}
 	}
 
-	ttl := time.Duration(d.Get("ttl").(int)) * time.Second
-	maxTTL := time.Duration(d.Get("max_ttl").(int)) * time.Second
-	if ttl == 0 {
-		ttl = defaultServiceAccountTTL
+	if existing != nil && !ttlSet {
+		ttl = existing.TTL
+	} else {
+		ttl = time.Duration(d.Get("ttl").(int)) * time.Second
+		if ttl == 0 {
+			ttl = defaultServiceAccountTTL
+		}
 	}
-	if maxTTL == 0 {
-		maxTTL = defaultServiceAccountMaxTTL
+
+	if existing != nil && !maxTTLSet {
+		maxTTL = existing.MaxTTL
+	} else {
+		maxTTL = time.Duration(d.Get("max_ttl").(int)) * time.Second
+		if maxTTL == 0 {
+			maxTTL = defaultServiceAccountMaxTTL
+		}
 	}
+
 	if ttl > maxTTL {
 		return logical.ErrorResponse("ttl of %s exceeds max_ttl of %s", ttl, maxTTL), nil
 	}
@@ -147,15 +178,21 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 			maxTTL, client.MaxAPIKeyExpiry, apiKeyExpiryGrace), nil
 	}
 
+	if existing != nil && !descriptionSet {
+		description = existing.Description
+	} else {
+		description = d.Get("description").(string)
+		if description == "" {
+			description = fmt.Sprintf("Managed by Vault mount %s", req.MountPoint)
+		}
+	}
+
 	entry := &serviceAccountEntry{
 		AccountRole:     accountRole,
 		NamespaceAccess: namespaceAccess,
-		Description:     d.Get("description").(string),
+		Description:     description,
 		TTL:             ttl,
 		MaxTTL:          maxTTL,
-	}
-	if entry.Description == "" {
-		entry.Description = fmt.Sprintf("Managed by Vault mount %s", req.MountPoint)
 	}
 
 	spec := client.ServiceAccountSpec{
@@ -366,9 +403,18 @@ const pathServiceAccountHelp = `
 Defines a Temporal Cloud service account managed by Vault, and the credential
 policy for API keys issued from it.
 
-Writing this path creates the service account in Temporal Cloud; deleting it
-deletes the service account, which invalidates every API key it owns. Changing
-only ttl or max_ttl is a Vault-side change and makes no Temporal Cloud call.
+Creating requires the full spec: account_role, and optionally namespace_access,
+description, ttl, and max_ttl. Deleting it deletes the service account, which
+invalidates every API key it owns.
+
+Updating merges against what is already stored: any of namespace_access,
+description, ttl, or max_ttl that you omit keeps its current value, so
+'vault write service-accounts/<name> account_role=admin' changes only the role.
+account_role itself is required on every write. To deliberately clear
+namespace_access, pass it explicitly as an empty string
+(namespace_access="") — that reaches Temporal Cloud and revokes those
+namespace permissions, unlike a ttl or max_ttl change, which is Vault-side only
+and makes no Temporal Cloud call.
 
 Read credentials for this service account from creds/<name>.
 

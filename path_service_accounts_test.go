@@ -364,6 +364,279 @@ func TestServiceAccounts_Validation(t *testing.T) {
 	}
 }
 
+// This is the regression test for the defect: a partial update (only
+// account_role supplied) must not touch namespace_access, ttl, or max_ttl, and
+// because nothing Temporal Cloud knows about actually changed, it must not call
+// UpdateServiceAccount at all. Before the fix, d.Get("namespace_access")
+// returned the zero value ([]string{}) on this request, which cleared the
+// stored permission and triggered an unwanted UpdateServiceAccount call that
+// would have revoked it in Temporal Cloud.
+func TestServiceAccounts_PartialUpdatePreservesOmittedFields(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	updates := 0
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	stub.updateServiceAccountFn = func(context.Context, string, client.ServiceAccountSpec) error {
+		updates++
+		return nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+	updates = 0 // mustWriteConfig's own validation call does not count.
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role":     "developer",
+			"namespace_access": []string{"prod.acct1=write"},
+			"ttl":              "1h",
+			"max_ttl":          "8h",
+		},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// account_role is supplied unchanged (still required on every write).
+	// namespace_access, ttl, and max_ttl are omitted entirely, not set to
+	// empty. Since nothing cloud-visible actually changes, this must be a
+	// pure Vault-side no-op as far as Temporal Cloud is concerned.
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "developer"},
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if updates != 0 {
+		t.Errorf("expected no UpdateServiceAccount call when nothing cloud-visible changed, got %d", updates)
+	}
+
+	entry, err := b.getServiceAccount(context.Background(), storage, "svc")
+	if err != nil || entry == nil {
+		t.Fatalf("getServiceAccount: err=%v entry=%v", err, entry)
+	}
+	if entry.AccountRole != "developer" {
+		t.Errorf("expected role to remain developer, got %q", entry.AccountRole)
+	}
+	if entry.NamespaceAccess["prod.acct1"] != "write" {
+		t.Errorf("expected namespace_access to be preserved, got %v", entry.NamespaceAccess)
+	}
+	if entry.TTL.String() != "1h0m0s" {
+		t.Errorf("expected ttl to be preserved at 1h, got %v", entry.TTL)
+	}
+	if entry.MaxTTL.String() != "8h0m0s" {
+		t.Errorf("expected max_ttl to be preserved at 8h, got %v", entry.MaxTTL)
+	}
+}
+
+// Explicitly passing namespace_access="" is how an operator deliberately
+// clears every namespace permission. Unlike an omitted field, this must reach
+// Temporal Cloud.
+func TestServiceAccounts_ExplicitEmptyNamespaceAccessClearsAndCallsCloud(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	updates := 0
+	var lastSpec client.ServiceAccountSpec
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	stub.updateServiceAccountFn = func(_ context.Context, _ string, spec client.ServiceAccountSpec) error {
+		updates++
+		lastSpec = spec
+		return nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+	updates = 0
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role":     "developer",
+			"namespace_access": []string{"prod.acct1=write"},
+		},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role":     "admin",
+			"namespace_access": "",
+		},
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if updates != 1 {
+		t.Fatalf("expected exactly one UpdateServiceAccount call, got %d", updates)
+	}
+	if len(lastSpec.NamespaceAccess) != 0 {
+		t.Errorf("expected namespace_access sent to Temporal Cloud to be empty, got %v", lastSpec.NamespaceAccess)
+	}
+
+	entry, err := b.getServiceAccount(context.Background(), storage, "svc")
+	if err != nil || entry == nil {
+		t.Fatalf("getServiceAccount: err=%v entry=%v", err, entry)
+	}
+	if len(entry.NamespaceAccess) != 0 {
+		t.Errorf("expected namespace_access to be cleared, got %v", entry.NamespaceAccess)
+	}
+}
+
+// Supplying a new namespace_access on update replaces the stored value
+// entirely and calls UpdateServiceAccount.
+func TestServiceAccounts_NewNamespaceAccessReplacesAndCallsCloud(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	updates := 0
+	var lastSpec client.ServiceAccountSpec
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	stub.updateServiceAccountFn = func(_ context.Context, _ string, spec client.ServiceAccountSpec) error {
+		updates++
+		lastSpec = spec
+		return nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+	updates = 0
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role":     "developer",
+			"namespace_access": []string{"prod.acct1=write"},
+		},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role":     "admin",
+			"namespace_access": []string{"staging.acct1=read"},
+		},
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if updates != 1 {
+		t.Fatalf("expected exactly one UpdateServiceAccount call, got %d", updates)
+	}
+	if lastSpec.NamespaceAccess["staging.acct1"] != "read" {
+		t.Errorf("expected staging.acct1=read sent to Temporal Cloud, got %v", lastSpec.NamespaceAccess)
+	}
+	if _, stillThere := lastSpec.NamespaceAccess["prod.acct1"]; stillThere {
+		t.Errorf("expected prod.acct1 to be gone after replacement, got %v", lastSpec.NamespaceAccess)
+	}
+
+	entry, err := b.getServiceAccount(context.Background(), storage, "svc")
+	if err != nil || entry == nil {
+		t.Fatalf("getServiceAccount: err=%v entry=%v", err, entry)
+	}
+	if entry.NamespaceAccess["staging.acct1"] != "read" {
+		t.Errorf("expected stored namespace_access to be replaced, got %v", entry.NamespaceAccess)
+	}
+}
+
+// Create is unaffected by the merge logic: there is nothing to merge against,
+// so an omitted field takes its default exactly as before.
+func TestServiceAccounts_CreateOmittedFieldsTakeDefaults(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "read"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	entry, err := b.getServiceAccount(context.Background(), storage, "svc")
+	if err != nil || entry == nil {
+		t.Fatalf("getServiceAccount: err=%v entry=%v", err, entry)
+	}
+	if entry.TTL != defaultServiceAccountTTL {
+		t.Errorf("expected default ttl %v, got %v", defaultServiceAccountTTL, entry.TTL)
+	}
+	if entry.MaxTTL != defaultServiceAccountMaxTTL {
+		t.Errorf("expected default max_ttl %v, got %v", defaultServiceAccountMaxTTL, entry.MaxTTL)
+	}
+	if len(entry.NamespaceAccess) != 0 {
+		t.Errorf("expected no namespace_access, got %v", entry.NamespaceAccess)
+	}
+}
+
+// Validation must apply to the merged result, not just to whatever was
+// supplied on the request. A stored max_ttl of 8h combined with a
+// newly-supplied ttl of 10h violates ttl <= max_ttl even though neither value
+// looks invalid in isolation.
+func TestServiceAccounts_ValidationAppliesToMergedResult(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role": "read",
+			"ttl":          "1h",
+			"max_ttl":      "8h",
+		},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// max_ttl is omitted here, so it merges in from storage as 8h. A ttl of
+	// 10h alone should not pass the ttl <= max_ttl check.
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "service-accounts/svc",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role": "read",
+			"ttl":          "10h",
+		},
+	})
+	if err == nil && (resp == nil || !resp.IsError()) {
+		t.Fatal("expected the merged ttl > max_ttl to be rejected")
+	}
+}
+
 // failingStorage fails writes under a given prefix, to exercise compensation.
 type failingStorage struct {
 	logical.Storage
