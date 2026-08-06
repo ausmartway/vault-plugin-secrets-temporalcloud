@@ -4648,6 +4648,189 @@ service-accounts/*."
 
 ---
 
+### Task 10: Name-collision detection and forced adoption
+
+Added after the plan was written, at the project owner's request. **Execute this immediately after Task 6**, before Task 7 — it touches the same file and the same mental context.
+
+Temporal Cloud requires service-account names to be unique across all active service accounts. Today, writing `service-accounts/prod-workers` when a `prod-workers` already exists in Temporal Cloud sends `CreateServiceAccount`, the server rejects the duplicate, and our error mapping renders it as a generic `ErrInvalidArgument` carrying Temporal Cloud's own wording. The operator gets no guidance about what to do.
+
+This task detects the collision before creating, refuses by default with an actionable message, and offers `force=true` to adopt the existing account instead.
+
+**Files:**
+- Modify: `client/client.go` — add `FindServiceAccountByName` to the `CloudOps` interface
+- Modify: `client/grpc.go` — implement it
+- Modify: `path_service_accounts.go` — the `force` field, collision check, adoption branch, help text
+- Test: `client/grpc_test.go`, `path_service_accounts_test.go`
+- Extend: the `stubCloudOps` double with a `findServiceAccountByNameFn` hook
+
+**Interfaces:**
+- Consumes: everything from Tasks 1-6.
+- Produces: `FindServiceAccountByName(ctx context.Context, name string) (*ServiceAccount, error)` on `CloudOps`, returning `ErrNotFound` when no active service account carries that name; a `force` boolean field on `service-accounts/<name>`; and an `Adopted bool` field on `serviceAccountEntry`, surfaced as `adopted` on read.
+
+- [ ] **Step 1: Write the failing tests**
+
+Cover, at minimum:
+
+1. **Collision refused by default.** `FindServiceAccountByName` returns an existing account; the write fails; the message names the colliding account's Temporal Cloud ID, states that the name is already in use, and tells the operator their two options (choose a different name, or re-run with `force=true`). Assert `CreateServiceAccount` was NOT called and nothing was persisted.
+2. **Collision adopted with `force=true`.** The write succeeds; `CreateServiceAccount` was NOT called; `UpdateServiceAccount` WAS called with the spec from the request (this is the "reset permissions" part); the stored entry carries the existing account's ID and `Adopted: true`.
+3. **No collision, no force.** Unchanged behaviour: `FindServiceAccountByName` returns `ErrNotFound`, `CreateServiceAccount` is called, entry stored with `Adopted: false`.
+4. **No collision, `force=true`.** `force` on a name that does not exist is not an error — it simply creates, exactly as without the flag. `force` means "adopt if it exists", not "require that it exists".
+5. **`force` is ignored on update.** Writing to an entry Vault already manages takes the ordinary merge path from Task 6; no name lookup happens, because the binding already exists.
+6. **Read surfaces `adopted`.** Both true and false cases.
+7. **Lookup failure is not a silent create.** If `FindServiceAccountByName` returns an error that is not `ErrNotFound` (e.g. `ErrUnavailable`), the write must fail rather than fall through to creating a duplicate.
+
+Remember the subtlety that has bitten earlier tasks: writing `config` performs one credential-validation `GetServiceAccount` call, so any call-counting test must account for it.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `go test . -run TestServiceAccounts -v`
+Expected: FAIL — `force` is not a known field, `FindServiceAccountByName` undefined.
+
+- [ ] **Step 3: Add `FindServiceAccountByName` to the `CloudOps` interface**
+
+In `client/client.go`, inside the interface:
+
+```go
+	// FindServiceAccountByName looks up an active service account by its
+	// Temporal Cloud name, returning ErrNotFound if none carries that name.
+	//
+	// Temporal Cloud requires these names to be unique across active service
+	// accounts, so this is how the engine detects that a name an operator
+	// asked for is already taken by an account Vault did not create.
+	FindServiceAccountByName(ctx context.Context, name string) (*ServiceAccount, error)
+```
+
+- [ ] **Step 4: Implement it in `client/grpc.go`**
+
+```go
+func (c *grpcClient) FindServiceAccountByName(ctx context.Context, name string) (*ServiceAccount, error) {
+	pageToken := ""
+
+	// There is no lookup-by-name RPC, so page through and match. Accounts are
+	// few (Temporal Cloud accounts hold tens, not thousands), so this stays
+	// cheap, and it only runs when creating a new binding.
+	for {
+		resp, err := c.svc.GetServiceAccounts(ctx, &cloudservicev1.GetServiceAccountsRequest{
+			PageSize:  100,
+			PageToken: pageToken,
+		})
+		if err != nil {
+			return nil, MapGRPCError(err)
+		}
+
+		// Note the SINGULAR getter on a repeated field — a generated-code quirk.
+		for _, sa := range resp.GetServiceAccount() {
+			if sa.GetSpec().GetName() != name {
+				continue
+			}
+			return &ServiceAccount{
+				ID:              sa.GetId(),
+				ResourceVersion: sa.GetResourceVersion(),
+				Spec:            specFromProto(sa.GetSpec()),
+			}, nil
+		}
+
+		nextPageToken := resp.GetNextPageToken()
+		if nextPageToken == "" {
+			return nil, fmt.Errorf("%w: no service account named %q", ErrNotFound, name)
+		}
+		// Same non-advancing-token guard as CountAPIKeys: a server that stops
+		// advancing would otherwise spin this loop forever.
+		if nextPageToken == pageToken {
+			return nil, fmt.Errorf("%w: GetServiceAccounts page token did not advance", ErrUnavailable)
+		}
+		pageToken = nextPageToken
+	}
+}
+```
+
+- [ ] **Step 5: Add the `force` field and the collision branch**
+
+Add to the path's `Fields` map:
+
+```go
+			"force": {
+				Type: framework.TypeBool,
+				Description: "If a service account with this name already exists in Temporal Cloud, adopt it and reset its permissions to this specification instead of failing. Ignored when updating an entry Vault already manages.",
+			},
+```
+
+Add `Adopted bool \`json:"adopted"\`` to `serviceAccountEntry`, and return it as `adopted` from the read handler.
+
+In `pathServiceAccountWrite`, the create branch (`existing == nil`) becomes:
+
+```go
+	case existing == nil:
+		// Temporal Cloud requires service-account names to be unique, so a
+		// name already in use would be rejected by the server with a message
+		// that does not tell the operator what to do about it. Check first and
+		// explain the options ourselves.
+		found, err := c.FindServiceAccountByName(ctx, name)
+		switch {
+		case err == nil:
+			if !force {
+				return logical.ErrorResponse(
+					"a service account named %q already exists in Temporal Cloud (id %s) and "+
+						"Vault did not create it. Either choose a different name, or re-run "+
+						"with force=true to have Vault adopt that account and reset its "+
+						"permissions to this specification.",
+					name, found.ID), nil
+			}
+
+			// Adopt it: bind to the existing account and overwrite its spec so
+			// what Vault stores and what Temporal Cloud enforces agree.
+			entry.ServiceAccountID = found.ID
+			entry.Adopted = true
+
+			if err := c.UpdateServiceAccount(ctx, found.ID, spec); err != nil {
+				return nil, fmt.Errorf("adopting service account %q: %w", name, err)
+			}
+
+		case errors.Is(err, client.ErrNotFound):
+			// The name is free — create it, which is the ordinary path.
+			id, err := c.CreateServiceAccount(ctx, spec)
+			if err != nil {
+				return nil, fmt.Errorf("creating service account %q in Temporal Cloud: %w", name, err)
+			}
+			entry.ServiceAccountID = id
+
+		default:
+			// Any other lookup failure must not fall through to creating a
+			// duplicate — we simply do not know whether the name is free.
+			return nil, fmt.Errorf("checking whether service account %q already exists: %w", name, err)
+		}
+```
+
+Read `force` with `force := d.Get("force").(bool)` near the other field reads. It is deliberately NOT merged on update (Task 6's merge rules do not apply to it) because it describes an action, not stored state.
+
+Note the compensating-delete logic from Task 6 must NOT fire for an adopted account on a storage failure — Vault would be deleting an account it did not create. Guard it on `!entry.Adopted` as well as `existing == nil`.
+
+- [ ] **Step 6: Update the help text**
+
+`pathServiceAccountHelp` must state that creating fails if the name is already taken in Temporal Cloud, that `force=true` adopts the existing account and resets its permissions, and — importantly — that an adopted account becomes fully Vault-managed, so deleting the Vault entry deletes it in Temporal Cloud like any other. An operator must not learn that by discovering it.
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `gofmt -w . && go test ./... -count=1 && go test ./... -race -count=1`
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add .
+git commit -m "feat: detect service-account name collisions, add force adoption
+
+Temporal Cloud requires unique service-account names, so writing a name that
+already exists produced a bare server rejection with no guidance. The engine now
+looks the name up first and either refuses with an actionable message or, with
+force=true, adopts the existing account and resets its permissions to match.
+
+An adopted account becomes fully Vault-managed, including deletion; the entry
+records that it was adopted and the path help says so."
+```
+
+---
+
 ## Verification against the spec's success criteria
 
 After Task 9, confirm each criterion from the spec:
