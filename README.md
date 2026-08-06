@@ -424,3 +424,8 @@ make test        # fast tests
 make test-live   # live acceptance tests — see "Running tests" above
 make sweep       # clean up debris from a failed live run
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE). Same license as
+[temporalio/temporal](https://github.com/temporalio/temporal).
