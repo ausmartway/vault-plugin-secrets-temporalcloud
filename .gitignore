@@ -5,6 +5,9 @@
 /bin/
 /vault-plugin-secrets-temporalcloud
 
+# GoReleaser build artifacts
+/dist/
+
 # Credentials — never commit these.
 # The .env.* glob and the swap-file patterns matter as much as .env itself: an
 # in-progress `vim .env` leaves a .env.swp holding the same secret in plaintext.

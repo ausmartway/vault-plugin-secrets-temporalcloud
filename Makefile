@@ -2,7 +2,7 @@ PLUGIN_NAME := vault-plugin-secrets-temporalcloud
 PLUGIN_DIR  := ./bin
 MOUNT       := temporalcloud
 
-.PHONY: build test test-live sweep dev fmt lint clean
+.PHONY: build test test-live sweep dev snapshot release-check release fmt lint clean
 
 ## build: compile the plugin and print the SHA256 Vault needs for registration
 build:
@@ -30,6 +30,22 @@ sweep:
 dev:
 	@./scripts/dev.sh
 
+## release-check: validate the GoReleaser config without building
+release-check:
+	goreleaser check
+
+## snapshot: build release artifacts locally into dist/, publishing nothing
+snapshot:
+	goreleaser release --snapshot --clean
+
+## release: build and publish a GitHub release for the current tag.
+## Tag first (git tag -a v0.1.0 -m ... && git push origin v0.1.0) — GoReleaser
+## refuses to run on an untagged or dirty tree, which is the behaviour you want.
+release:
+	@test -n "$$GITHUB_TOKEN" || \
+		(echo "GITHUB_TOKEN is not set. Try: export GITHUB_TOKEN=\$$(gh auth token)"; exit 1)
+	goreleaser release --clean
+
 fmt:
 	gofmt -w .
 
@@ -37,4 +53,4 @@ lint:
 	golangci-lint run
 
 clean:
-	rm -rf $(PLUGIN_DIR)
+	rm -rf $(PLUGIN_DIR) dist

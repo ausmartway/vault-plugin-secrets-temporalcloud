@@ -1,0 +1,133 @@
+# GoReleaser configuration for the Temporal Cloud Vault secrets engine.
+#
+# Vault loads external plugins as a single self-contained binary that an
+# operator registers by SHA256. That shapes almost every choice below: one
+# binary per archive with nothing else in it, and a checksums file published
+# alongside, because the checksum is not a nicety here — Vault refuses to load
+# a plugin whose SHA256 does not match what was registered.
+#
+#   goreleaser release --snapshot --clean   # build locally, publish nothing
+#   goreleaser release --clean              # tag-driven, publishes to GitHub
+version: 2
+
+project_name: vault-plugin-secrets-temporalcloud
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./... -count=1
+
+builds:
+  - id: plugin
+    main: ./cmd/vault-plugin-secrets-temporalcloud
+    binary: vault-plugin-secrets-temporalcloud
+
+    # Vault plugin binaries are copied into a plugin directory on a server that
+    # may not share our libc. A static binary avoids that entire class of
+    # "works on my laptop" failure.
+    env:
+      - CGO_ENABLED=0
+
+    # Linux for real Vault servers, darwin for local development and demos.
+    # Windows is omitted deliberately: Vault's plugin directory and the
+    # execution model around it are not a path we have tested.
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .CommitDate }}
+
+    # Reproducible builds: without this the binary embeds the build time, so
+    # the same source produces a different SHA256 on every run — which would
+    # make the registration checksum meaningless.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: plugin
+    ids:
+      - plugin
+    formats:
+      - zip
+
+    # <name>_<version>_<os>_<arch>.zip, matching the convention HashiCorp uses
+    # for its own Vault plugins.
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+    # The archive holds the bare binary and nothing else, so unzipping it
+    # straight into Vault's plugin directory does the right thing. A README or
+    # LICENSE in there would land next to the binary and have to be cleaned up.
+    files:
+      - none*
+
+checksum:
+  # Operators need this to register the plugin:
+  #   vault plugin register -sha256=<from this file> ...
+  name_template: "{{ .ProjectName }}_{{ .Version }}_SHA256SUMS"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    # The engine's own history is the interesting part; housekeeping is not.
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+      - "Merge branch"
+
+release:
+  draft: false
+  prerelease: auto
+  header: |
+    ## Temporal Cloud secrets engine for HashiCorp Vault
+
+    Provisions Temporal Cloud service accounts and issues short-lived Temporal
+    Cloud API keys as Vault dynamic secrets. Each key is deleted when its Vault
+    lease is revoked or expires.
+
+  footer: |
+    ### Installing
+
+    There are **two different checksums** here and mixing them up is the usual
+    reason a plugin fails to register. The `_SHA256SUMS` file covers the
+    **archives**, and verifies your download arrived intact. Vault instead
+    wants the hash of the **extracted binary**.
+
+    ```bash
+    # 1. verify the download
+    shasum -a 256 -c vault-plugin-secrets-temporalcloud_<version>_SHA256SUMS \
+        --ignore-missing
+
+    # 2. extract into Vault's plugin directory
+    unzip vault-plugin-secrets-temporalcloud_<version>_<os>_<arch>.zip \
+        -d "$VAULT_PLUGIN_DIR"
+
+    # 3. register with the hash of the BINARY, not the archive
+    SHA=$(shasum -a 256 "$VAULT_PLUGIN_DIR/vault-plugin-secrets-temporalcloud" \
+        | cut -d' ' -f1)
+    vault plugin register -sha256="$SHA" \
+        secret vault-plugin-secrets-temporalcloud
+    vault secrets enable -path=temporalcloud vault-plugin-secrets-temporalcloud
+    ```
+
+    Confirm you deployed what you meant to — Vault gives you no way to ask a
+    registered plugin its version:
+
+    ```bash
+    ./vault-plugin-secrets-temporalcloud --version
+    ```
+
+    See the README for configuration, the 20-keys-per-service-account ceiling,
+    and Temporal Cloud's undocumented 24-hour minimum API key expiry.

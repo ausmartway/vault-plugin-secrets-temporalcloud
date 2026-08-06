@@ -51,6 +51,55 @@ without it the rotation step cannot delete the key you pasted, and says so.
 See [`examples/README.md`](examples/README.md) for what to look at in the
 Temporal Cloud UI at each step.
 
+## Installing a release
+
+`make dev` is for demos. On a real Vault server, install a built release.
+
+Grab the archive for your platform from the
+[releases page](https://github.com/ausmartway/vault-plugin-secrets-temporalcloud/releases).
+**There are two different checksums involved, and confusing them is the usual
+reason registration fails.** The published `_SHA256SUMS` file covers the
+*archives* and proves your download arrived intact. Vault instead verifies the
+hash of the *extracted binary*.
+
+```bash
+VERSION=0.0.1
+OS=linux ARCH=amd64                       # or darwin / arm64
+
+# 1. verify the download
+shasum -a 256 -c "vault-plugin-secrets-temporalcloud_${VERSION}_SHA256SUMS" \
+    --ignore-missing
+
+# 2. extract into Vault's plugin directory
+unzip "vault-plugin-secrets-temporalcloud_${VERSION}_${OS}_${ARCH}.zip" \
+    -d "$VAULT_PLUGIN_DIR"
+
+# 3. register with the hash of the BINARY, not the archive
+SHA=$(shasum -a 256 "$VAULT_PLUGIN_DIR/vault-plugin-secrets-temporalcloud" \
+    | cut -d' ' -f1)
+vault plugin register -sha256="$SHA" \
+    secret vault-plugin-secrets-temporalcloud
+vault secrets enable -path=temporalcloud vault-plugin-secrets-temporalcloud
+```
+
+Vault gives you no way to ask a registered plugin which build it is running, so
+if you need to confirm what landed in the plugin directory, ask the binary:
+
+```bash
+./vault-plugin-secrets-temporalcloud --version
+```
+
+Releases are built by [GoReleaser](https://goreleaser.com) from a git tag, for
+linux and darwin on amd64 and arm64, statically linked (`CGO_ENABLED=0`) so the
+binary does not depend on the Vault host's libc. To cut one:
+
+```bash
+make release-check                        # validate .goreleaser.yaml
+make snapshot                             # build locally into dist/, publish nothing
+git tag -a v0.1.0 -m "..." && git push origin v0.1.0
+GITHUB_TOKEN=$(gh auth token) make release
+```
+
 ## Paths
 
 ### `config`
