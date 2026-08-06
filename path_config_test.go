@@ -3,6 +3,7 @@ package temporalcloud
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,7 +78,8 @@ func withStubClient(b *backend, stub client.CloudOps) {
 
 func TestConfig_WriteAndRead(t *testing.T) {
 	b, storage := newTestBackend(t)
-	withStubClient(b, &stubCloudOps{})
+	stub := &stubCloudOps{}
+	withStubClient(b, stub)
 
 	resp, err := b.HandleRequest(context.Background(), &logical.Request{
 		Operation: logical.CreateOperation,
@@ -90,6 +92,12 @@ func TestConfig_WriteAndRead(t *testing.T) {
 	})
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("write config: err=%v resp=%v", err, resp)
+	}
+
+	// The validation client is throwaway: it must be closed on the success
+	// path too, or a successful write leaks a gRPC connection.
+	if !stub.closed {
+		t.Error("expected the validation client to be closed after a successful write")
 	}
 
 	resp, err = b.HandleRequest(context.Background(), &logical.Request{
@@ -139,11 +147,12 @@ func TestConfig_ReadNeverReturnsAPIKey(t *testing.T) {
 // use, so the operator finds out immediately.
 func TestConfig_WriteRejectsBadCredential(t *testing.T) {
 	b, storage := newTestBackend(t)
-	withStubClient(b, &stubCloudOps{
+	stub := &stubCloudOps{
 		getServiceAccountFn: func(context.Context, string) (*client.ServiceAccount, error) {
 			return nil, client.ErrPermissionDenied
 		},
-	})
+	}
+	withStubClient(b, stub)
 
 	resp, err := b.HandleRequest(context.Background(), &logical.Request{
 		Operation: logical.CreateOperation,
@@ -156,6 +165,59 @@ func TestConfig_WriteRejectsBadCredential(t *testing.T) {
 	})
 	if err == nil && (resp == nil || !resp.IsError()) {
 		t.Fatal("expected writing an invalid credential to fail")
+	}
+
+	// The validation client must be closed even when validation fails, or a
+	// rejected config write leaks a gRPC connection.
+	if !stub.closed {
+		t.Error("expected the validation client to be closed after a rejected write")
+	}
+
+	// Nothing may be persisted when validation fails.
+	entry, err := storage.Get(context.Background(), configStoragePath)
+	if err != nil {
+		t.Fatalf("storage get: %v", err)
+	}
+	if entry != nil {
+		t.Fatal("config must not be persisted when validation fails")
+	}
+}
+
+// Writing config with an admin_service_account_id that does not exist in the
+// Temporal Cloud account must be rejected with a message distinct from the
+// bad-credential case, so an operator who fat-fingered the ID is pointed at
+// admin_service_account_id rather than told to check their api_key.
+func TestConfig_WriteRejectsUnknownServiceAccount(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{
+		getServiceAccountFn: func(context.Context, string) (*client.ServiceAccount, error) {
+			return nil, client.ErrNotFound
+		},
+	}
+	withStubClient(b, stub)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"api_key":                  "tmprl_sk_test",
+			"admin_service_account_id": "sa-does-not-exist",
+		},
+	})
+	if err == nil && (resp == nil || !resp.IsError()) {
+		t.Fatal("expected writing config with an unknown admin_service_account_id to fail")
+	}
+
+	// The message must name the offending ID and point at
+	// admin_service_account_id, so it reads differently from the
+	// bad-credential (ErrPermissionDenied) message.
+	msg := resp.Error().Error()
+	if !strings.Contains(msg, "sa-does-not-exist") {
+		t.Errorf("expected error to name the service account ID, got: %s", msg)
+	}
+	if !strings.Contains(msg, "admin_service_account_id") {
+		t.Errorf("expected error to mention admin_service_account_id, got: %s", msg)
 	}
 
 	// Nothing may be persisted when validation fails.
