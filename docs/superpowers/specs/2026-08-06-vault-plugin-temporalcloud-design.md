@@ -44,8 +44,12 @@ Verified against Temporal documentation before designing. These drive several de
 
 | Fact | Consequence for this design |
 | --- | --- |
-| Cloud Ops API: gRPC `saas-api.tmprl.cloud:443`, HTTP `https://saas-api.tmprl.cloud` | Use gRPC with the official protos |
+| Cloud Ops API: gRPC `saas-api.tmprl.cloud:443`, HTTP `https://saas-api.tmprl.cloud` | Use gRPC via `go.temporal.io/cloud-sdk` |
+| The Go client lives in `go.temporal.io/cloud-sdk` v0.14.1, package `cloudclient` — **not** in `go.temporal.io/api`, which has no `cloud/` package at all. `github.com/temporalio/cloud-api` is protos-only with no Go code. | Correct dependency; verified by inspecting the module |
 | All mutations are **async** — return an operation ID to poll | A polling layer hides this from all callers |
+| Terminal async states are `FULFILLED` (success), `FAILED`, `CANCELLED`, `REJECTED` — there is no `SUCCEEDED` | Poll until `FULFILLED`; treat the other three as errors |
+| `CreateApiKeyResponse` carries `KeyId` and `Token` directly on the response | Token is available without a follow-up read |
+| The SDK's default retry interceptor already sets `async_operation_id` on writes and retries with exponential backoff + jitter, max 7 attempts | Do **not** hand-roll idempotency keys or retries |
 | API key tokens are returned **once**, at creation | Perfect fit for Vault's dynamic-secret model |
 | `CreateApiKey` supports **service-account owners only** (not users) | Root credential must itself be a service-account key |
 | **Max 20 non-expired keys per service account** | Hard ceiling of 20 concurrent leases per SA |
@@ -92,7 +96,9 @@ most deployments will not reach.
 **Live-only integration tests.** Chosen deliberately over an in-process fake. Consequence, recorded
 here rather than argued: there is no CI-runnable integration suite, and a test that dies mid-flight
 leaves real resources behind. Mitigated by the fast/live split and cleanup discipline in *Testing*
-below. The `CloudOps` interface makes adding a fake later a pure addition, with no redesign.
+below. The `CloudOps` interface makes adding a fake later a pure addition, with no redesign. Worth
+noting for that follow-on: `cloudclient.Options` exposes `AllowInsecure` and `GRPCDialOptions`, so an
+in-process fake gRPC server over bufconn would be cheap to wire up if the live-only loop proves painful.
 
 ## Architecture
 
@@ -106,12 +112,15 @@ vault-plugin-temporalcloud/
 ├── secret_api_key.go         lease renew + revoke
 └── client/
     ├── client.go             CloudOps interface — the seam
-    ├── grpc.go               real implementation over go.temporal.io/api/cloud/...
+    ├── grpc.go               real implementation over go.temporal.io/cloud-sdk/cloudclient
     ├── async.go              poll GetAsyncOperation to terminal state
     └── errors.go             gRPC status → Vault error mapping
 ```
 
 Module path: `github.com/temporal-sa/vault-plugin-temporalcloud`. Go 1.26.
+
+Dependencies: `go.temporal.io/cloud-sdk` v0.14.1 (Cloud Ops client and generated protos) and
+`github.com/hashicorp/vault/sdk` v0.25.1 (plugin framework).
 
 `client.CloudOps` is the boundary between Vault logic and Temporal Cloud. Everything above it is
 plain Vault path handling and never mentions gRPC or async operations; everything below it never
@@ -289,11 +298,14 @@ stay under 20 per service account, and lease revocation — not just expiry — 
 
 ## Error handling
 
-**Async operations.** `async.go` polls `GetAsyncOperation` on a 1s interval with a 60s deadline. The
-deadline sits under Vault's 90s default request timeout so the client gives up first and the operator
-sees this engine's error rather than a generic gateway timeout. Every mutation passes a generated
-`async_operation_id`, which Temporal Cloud treats as an idempotency key, so a retried request cannot
-double-create.
+**Async operations.** `async.go` polls `GetAsyncOperation` on a 1s interval with a 60s deadline until
+the operation reaches `FULFILLED`. The deadline sits under Vault's 90s default request timeout so the
+client gives up first and the operator sees this engine's error rather than a generic gateway timeout.
+`FAILED`, `CANCELLED`, and `REJECTED` are terminal errors and surface the operation's `failure_reason`.
+
+Idempotency and retries are **not** implemented here. The SDK's default interceptor already assigns
+`async_operation_id` on every write and retries retryable failures with exponential backoff and
+jitter, up to 7 attempts. Re-implementing either would fight the SDK.
 
 **gRPC status mapping**, so operators see causes rather than codes:
 
