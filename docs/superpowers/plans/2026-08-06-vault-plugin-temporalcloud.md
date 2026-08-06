@@ -4334,7 +4334,15 @@ Check it directly:
 go run ./cmd/checkcount   # see below
 ```
 
-Write `cmd/checkcount/main.go` as a throwaway that mints a key with a 60-second expiry on a test service account, prints `CountAPIKeys` before minting, after minting, and again after the key expires, then deletes the service account. If the third count does not return to the first, fix `CountAPIKeys` to filter on `ApiKey.State` — keep only `ResourceState_RESOURCE_STATE_ACTIVE` — and add a `TestLive_CountExcludesExpiredKeys` covering it.
+A read-only probe against the live account has already narrowed this: `GetApiKeys` returns an `ApiKey.State` field, and in an account with no expired keys every returned key was `RESOURCE_STATE_ACTIVE`. That did not settle the question — there were no expired keys to observe — so it still needs an empirical check.
+
+Write `cmd/checkcount/main.go` as a throwaway that mints a key with a short expiry on a test service account, prints `CountAPIKeys` before minting, after minting, and again after the key expires, then deletes the service account.
+
+**Do not simply filter to `RESOURCE_STATE_ACTIVE`.** That is the obvious fix and it is wrong, because it would *undercount*. Temporal Cloud's ceiling is on **non-expired** keys, and a key that has been *disabled* is not expired — it still occupies one of the 20 slots, but its state is not `ACTIVE`. Filtering to `ACTIVE` only would let the engine mint past the real ceiling and get a raw `ResourceExhausted` from the server, which is exactly the confusing failure the cap pre-check exists to prevent.
+
+So if the count needs filtering, exclude only the states that genuinely free a slot — `RESOURCE_STATE_EXPIRED` and `RESOURCE_STATE_DELETED` — and keep everything else, disabled keys included. Add a `TestLive_CountExcludesExpiredKeys` covering whichever behaviour you confirm.
+
+Note which direction each error runs, and prefer the safe one: overcounting refuses a mint early, with our clear message; undercounting exceeds the ceiling and surfaces a server error nobody can act on. When in doubt, overcount.
 
 Delete `cmd/checkcount` once the question is settled; record the answer as a comment on `CountAPIKeys` either way, so nobody has to re-derive it.
 
@@ -4394,7 +4402,10 @@ func main() {
 			os.Exit(1)
 		}
 
-		for _, sa := range resp.GetServiceAccounts() {
+		// Note the SINGULAR getter on a repeated field: the generated method is
+		// GetServiceAccount(), not GetServiceAccounts(), even though it returns a
+		// slice. Verified against cloud-sdk v0.16.0 with a live call.
+		for _, sa := range resp.GetServiceAccount() {
 			if !strings.HasPrefix(sa.GetSpec().GetName(), acctestPrefix) {
 				continue
 			}
