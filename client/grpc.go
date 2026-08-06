@@ -209,6 +209,46 @@ func (c *grpcClient) CountAPIKeys(ctx context.Context, serviceAccountID string) 
 	}
 }
 
+func (c *grpcClient) FindServiceAccountByName(ctx context.Context, name string) (*ServiceAccount, error) {
+	pageToken := ""
+
+	// There is no lookup-by-name RPC, so page through and match. Accounts are
+	// few (Temporal Cloud accounts hold tens, not thousands), so this stays
+	// cheap, and it only runs when creating a new binding.
+	for {
+		resp, err := c.svc.GetServiceAccounts(ctx, &cloudservicev1.GetServiceAccountsRequest{
+			PageSize:  100,
+			PageToken: pageToken,
+		})
+		if err != nil {
+			return nil, MapGRPCError(err)
+		}
+
+		// Note the SINGULAR getter on a repeated field — a generated-code quirk.
+		for _, sa := range resp.GetServiceAccount() {
+			if sa.GetSpec().GetName() != name {
+				continue
+			}
+			return &ServiceAccount{
+				ID:              sa.GetId(),
+				ResourceVersion: sa.GetResourceVersion(),
+				Spec:            specFromProto(sa.GetSpec()),
+			}, nil
+		}
+
+		nextPageToken := resp.GetNextPageToken()
+		if nextPageToken == "" {
+			return nil, fmt.Errorf("%w: no service account named %q", ErrNotFound, name)
+		}
+		// Same non-advancing-token guard as CountAPIKeys: a server that stops
+		// advancing would otherwise spin this loop forever.
+		if nextPageToken == pageToken {
+			return nil, fmt.Errorf("%w: GetServiceAccounts page token did not advance", ErrUnavailable)
+		}
+		pageToken = nextPageToken
+	}
+}
+
 // specFromProto renders a Temporal Cloud service account spec back into the
 // plain strings an operator wrote.
 func specFromProto(p *identityv1.ServiceAccountSpec) ServiceAccountSpec {

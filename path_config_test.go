@@ -14,13 +14,14 @@ import (
 // stubCloudOps records calls and returns canned responses. Later tasks extend
 // it; keep the zero value usable so tests only set what they care about.
 type stubCloudOps struct {
-	getServiceAccountFn    func(ctx context.Context, id string) (*client.ServiceAccount, error)
-	createServiceAccountFn func(ctx context.Context, spec client.ServiceAccountSpec) (string, error)
-	updateServiceAccountFn func(ctx context.Context, id string, spec client.ServiceAccountSpec) error
-	deleteServiceAccountFn func(ctx context.Context, id string) error
-	createAPIKeyFn         func(ctx context.Context, spec client.APIKeySpec) (*client.APIKey, error)
-	deleteAPIKeyFn         func(ctx context.Context, id string) error
-	countAPIKeysFn         func(ctx context.Context, saID string) (int, error)
+	getServiceAccountFn        func(ctx context.Context, id string) (*client.ServiceAccount, error)
+	createServiceAccountFn     func(ctx context.Context, spec client.ServiceAccountSpec) (string, error)
+	updateServiceAccountFn     func(ctx context.Context, id string, spec client.ServiceAccountSpec) error
+	deleteServiceAccountFn     func(ctx context.Context, id string) error
+	createAPIKeyFn             func(ctx context.Context, spec client.APIKeySpec) (*client.APIKey, error)
+	deleteAPIKeyFn             func(ctx context.Context, id string) error
+	countAPIKeysFn             func(ctx context.Context, saID string) (int, error)
+	findServiceAccountByNameFn func(ctx context.Context, name string) (*client.ServiceAccount, error)
 
 	deletedAPIKeys []string
 	closed         bool
@@ -74,6 +75,16 @@ func (s *stubCloudOps) CountAPIKeys(ctx context.Context, saID string) (int, erro
 		return s.countAPIKeysFn(ctx, saID)
 	}
 	return 0, nil
+}
+
+// FindServiceAccountByName defaults to ErrNotFound when no hook is set, so
+// every test written before this hook existed keeps taking the ordinary
+// create path unchanged.
+func (s *stubCloudOps) FindServiceAccountByName(ctx context.Context, name string) (*client.ServiceAccount, error) {
+	if s.findServiceAccountByNameFn != nil {
+		return s.findServiceAccountByNameFn(ctx, name)
+	}
+	return nil, client.ErrNotFound
 }
 
 func (s *stubCloudOps) Close() error {

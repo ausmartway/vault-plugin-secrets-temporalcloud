@@ -27,6 +27,14 @@ type CloudOps interface {
 	// invalidates the API keys it owns.
 	DeleteServiceAccount(ctx context.Context, id string) error
 
+	// FindServiceAccountByName looks up an active service account by its
+	// Temporal Cloud name, returning ErrNotFound if none carries that name.
+	//
+	// Temporal Cloud requires these names to be unique across active service
+	// accounts, so this is how the engine detects that a name an operator
+	// asked for is already taken by an account Vault did not create.
+	FindServiceAccountByName(ctx context.Context, name string) (*ServiceAccount, error)
+
 	// CreateAPIKey mints an API key. The returned APIKey carries the token,
 	// which Temporal Cloud reveals exactly once.
 	CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey, error)

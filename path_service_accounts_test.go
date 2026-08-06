@@ -218,6 +218,303 @@ func TestServiceAccounts_CompensatesWhenStorageFails(t *testing.T) {
 	}
 }
 
+// Temporal Cloud requires service-account names to be unique. Creating a name
+// that already exists there must be refused, name the colliding account's ID,
+// and never call CreateServiceAccount or persist anything.
+func TestServiceAccounts_CollisionRefusedByDefault(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	createCalled := false
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		createCalled = true
+		return "sa-new", nil
+	}
+	stub.findServiceAccountByNameFn = func(_ context.Context, name string) (*client.ServiceAccount, error) {
+		return &client.ServiceAccount{ID: "sa-existing"}, nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "developer"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if resp == nil || !resp.IsError() {
+		t.Fatalf("expected an error response, got %v", resp)
+	}
+	if !strings.Contains(resp.Error().Error(), "sa-existing") {
+		t.Errorf("expected the error to name the colliding account's ID, got: %v", resp.Error())
+	}
+	if !strings.Contains(resp.Error().Error(), "already exists") {
+		t.Errorf("expected the error to say the name is already in use, got: %v", resp.Error())
+	}
+	if !strings.Contains(resp.Error().Error(), "force=true") {
+		t.Errorf("expected the error to mention force=true as an option, got: %v", resp.Error())
+	}
+	if createCalled {
+		t.Error("expected CreateServiceAccount not to be called on a collision")
+	}
+
+	entry, err := storage.Get(context.Background(), serviceAccountStoragePath("prod-workers"))
+	if err != nil {
+		t.Fatalf("storage get: %v", err)
+	}
+	if entry != nil {
+		t.Fatal("expected nothing to be persisted when the create is refused")
+	}
+}
+
+// force=true on a colliding name adopts the existing account: it resets that
+// account's permissions to the requested spec via UpdateServiceAccount rather
+// than creating a new one, and the stored entry remembers it was adopted.
+func TestServiceAccounts_CollisionAdoptedWithForce(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	createCalled := false
+	var updatedID string
+	var updatedSpec client.ServiceAccountSpec
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		createCalled = true
+		return "sa-new", nil
+	}
+	stub.findServiceAccountByNameFn = func(_ context.Context, name string) (*client.ServiceAccount, error) {
+		return &client.ServiceAccount{ID: "sa-existing"}, nil
+	}
+	stub.updateServiceAccountFn = func(_ context.Context, id string, spec client.ServiceAccountSpec) error {
+		updatedID = id
+		updatedSpec = spec
+		return nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role": "developer",
+			"force":        true,
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("adopt: err=%v resp=%v", err, resp)
+	}
+	if createCalled {
+		t.Error("expected CreateServiceAccount not to be called when adopting")
+	}
+	if updatedID != "sa-existing" {
+		t.Errorf("expected UpdateServiceAccount to target sa-existing, got %q", updatedID)
+	}
+	if updatedSpec.AccountRole != "developer" {
+		t.Errorf("expected the adoption update to carry the requested spec, got %v", updatedSpec)
+	}
+
+	entry, err := b.getServiceAccount(context.Background(), storage, "prod-workers")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("expected an entry to be stored")
+	}
+	if entry.ServiceAccountID != "sa-existing" {
+		t.Errorf("expected the stored entry to carry the existing account's ID, got %q", entry.ServiceAccountID)
+	}
+	if !entry.Adopted {
+		t.Error("expected the stored entry to be marked Adopted")
+	}
+}
+
+// With no collision, force=true behaves exactly like an ordinary create: it
+// means "adopt if it exists," not "require that it exists."
+func TestServiceAccounts_NoCollisionForceStillCreates(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-created", nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role": "developer",
+			"force":        true,
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("create: err=%v resp=%v", err, resp)
+	}
+
+	entry, err := b.getServiceAccount(context.Background(), storage, "prod-workers")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("expected an entry to be stored")
+	}
+	if entry.ServiceAccountID != "sa-created" {
+		t.Errorf("expected the created account's ID, got %q", entry.ServiceAccountID)
+	}
+	if entry.Adopted {
+		t.Error("expected Adopted to be false when there was no collision")
+	}
+}
+
+// force is ignored on update: an entry Vault already manages takes the
+// ordinary merge path from Task 6, and no name lookup happens because the
+// binding already exists.
+func TestServiceAccounts_ForceIgnoredOnUpdate(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	lookupCalled := false
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-created", nil
+	}
+	stub.findServiceAccountByNameFn = func(context.Context, string) (*client.ServiceAccount, error) {
+		lookupCalled = true
+		return nil, client.ErrNotFound
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "developer"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	lookupCalled = false // reset: the create above legitimately looked it up
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role": "admin",
+			"force":        true,
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("update: err=%v resp=%v", err, resp)
+	}
+	if lookupCalled {
+		t.Error("expected FindServiceAccountByName not to be called on update")
+	}
+}
+
+// The read handler must surface whether an entry was adopted, in both
+// directions.
+func TestServiceAccounts_ReadSurfacesAdopted(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	stub := &stubCloudOps{}
+	stub.findServiceAccountByNameFn = func(_ context.Context, name string) (*client.ServiceAccount, error) {
+		return &client.ServiceAccount{ID: "sa-existing"}, nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	// Adopted case.
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/adopted-sa",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"account_role": "developer",
+			"force":        true,
+		},
+	}); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "service-accounts/adopted-sa",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read: err=%v resp=%v", err, resp)
+	}
+	if resp.Data["adopted"] != true {
+		t.Errorf("expected adopted=true, got %v", resp.Data["adopted"])
+	}
+
+	// Non-adopted case.
+	stub.findServiceAccountByNameFn = func(context.Context, string) (*client.ServiceAccount, error) {
+		return nil, client.ErrNotFound
+	}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-created", nil
+	}
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/created-sa",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "developer"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "service-accounts/created-sa",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read: err=%v resp=%v", err, resp)
+	}
+	if resp.Data["adopted"] != false {
+		t.Errorf("expected adopted=false, got %v", resp.Data["adopted"])
+	}
+}
+
+// A lookup failure that is not ErrNotFound must fail the write outright. We do
+// not know whether the name is free, so falling through to create would risk
+// creating the very duplicate this check exists to prevent.
+func TestServiceAccounts_LookupFailureDoesNotFallThroughToCreate(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	createCalled := false
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		createCalled = true
+		return "sa-new", nil
+	}
+	stub.findServiceAccountByNameFn = func(context.Context, string) (*client.ServiceAccount, error) {
+		return nil, client.ErrUnavailable
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "developer"},
+	})
+	if err == nil && (resp == nil || !resp.IsError()) {
+		t.Fatal("expected the write to fail when the collision lookup fails")
+	}
+	if createCalled {
+		t.Error("expected CreateServiceAccount not to be called after a lookup failure")
+	}
+}
+
 func TestServiceAccounts_List(t *testing.T) {
 	b, storage := newTestBackend(t)
 	stub := &stubCloudOps{}
