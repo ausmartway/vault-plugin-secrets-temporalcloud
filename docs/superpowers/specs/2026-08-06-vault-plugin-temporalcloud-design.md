@@ -54,6 +54,7 @@ Verified against Temporal documentation before designing. These drive several de
 | `CreateApiKey` supports **service-account owners only** (not users) | Root credential must itself be a service-account key |
 | **Max 20 non-expired keys per service account** | Hard ceiling of 20 concurrent leases per SA |
 | Max API key expiry: **2 years**; expiry is mandatory | Even the root key expires; `rotate-root` is not optional |
+| **Minimum API key expiry: 24 hours.** Found by live testing on 2026-08-06 — undocumented anywhere; the server rejects a shorter expiry with `expiry must be after <now+24h>`. | Key expiry must be floored at 24h and can no longer track `max_ttl`. See *The 24-hour expiry floor*. |
 | Account roles: `owner`, `admin`, `developer`, `finance-admin`, `read`, `metrics-read` | Enum validated at write time |
 | Namespace permissions: `admin`, `write`, `read` | Enum validated at write time |
 | No whoami RPC — a token does not reveal its owning identity | Operator must supply `admin_service_account_id` |
@@ -117,7 +118,7 @@ vault-plugin-temporalcloud/
     └── errors.go             gRPC status → Vault error mapping
 ```
 
-Module path: `github.com/temporal-sa/vault-plugin-temporalcloud`. Go 1.26.
+Module path: `github.com/ausmartway/vault-plugin-secrets-temporalcloud`. Go 1.26.
 
 Dependencies, both current as of 2026-08-06: `go.temporal.io/cloud-sdk` v0.16.0 (Cloud Ops client and
 generated protos, bundling Cloud Ops API version v0.19.1) and `github.com/hashicorp/vault/sdk` v0.25.1
@@ -265,7 +266,35 @@ The display name uses a random suffix rather than the lease ID because Vault ass
 Correlating a Temporal Cloud key back to a Vault lease is therefore done through the key ID, which
 Vault stores in the lease's internal data, not through the display name.
 
-### Why the Temporal-side expiry is `max_ttl + 10m`
+### The 24-hour expiry floor
+
+Live testing on 2026-08-06 revealed that Temporal Cloud refuses to mint an API key expiring less
+than 24 hours from now. This is undocumented, and it invalidates the original rule below that the
+key's expiry simply tracks `max_ttl + grace`: any `max_ttl` under roughly 23h50m made every mint
+fail outright. The spec's own `max_ttl=8h` example and the demo's `30m` would both have been
+rejected.
+
+The engine therefore floors the expiry:
+
+```go
+expiry := now.Add(max(entry.MaxTTL+apiKeyExpiryGrace, minimumAPIKeyExpiry+apiKeyExpiryGrace))
+```
+
+**This does not lengthen how long a credential is usable.** The engine's protection comes from
+*deleting the key when the lease ends*, not from the key's nominal expiry. A 15-minute lease still
+means the key is deleted after 15 minutes, and operators keep full freedom over `ttl` and `max_ttl`.
+
+What it does weaken is the fallback described below. The expiry exists so a key orphaned by a Vault
+failure — crash, storage loss, mount deleted — eventually self-destructs on its own. That window was
+one `max_ttl`; it is now at least 24 hours. An orphaned key can outlive its lease ceiling by up to a
+day. That is a real reduction in defence-in-depth and it is accepted deliberately, because the
+alternative is worse.
+
+Rejected alternative: require `max_ttl >= 24h`. It keeps the fallback tight and preserves the
+invariant that key expiry equals the lease ceiling, but it takes away the operator's ability to cap
+a lease below a day, and it undercuts the short-lived-credential story the engine exists to tell.
+
+### Why the Temporal-side expiry is at least `max_ttl + 10m`
 
 This is the load-bearing detail of the lifecycle.
 

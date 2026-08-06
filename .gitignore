@@ -1,0 +1,19 @@
+# Subagent-driven-development scratch workspace (ledgers, briefs, review packages)
+.superpowers/
+
+# Build output
+/bin/
+/vault-plugin-secrets-temporalcloud
+
+# Credentials — never commit these.
+# The .env.* glob and the swap-file patterns matter as much as .env itself: an
+# in-progress `vim .env` leaves a .env.swp holding the same secret in plaintext.
+.env
+.env.*
+*.pem
+*.key
+
+# Editor swap and backup files — these can hold secrets mid-edit
+*.swp
+*.swo
+*~
