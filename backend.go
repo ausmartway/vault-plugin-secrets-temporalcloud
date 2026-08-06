@@ -61,6 +61,7 @@ func Backend() *backend {
 		// Secrets is appended by later tasks.
 		Paths: []*framework.Path{
 			b.pathConfig(),
+			b.pathRotateRoot(),
 		},
 		Secrets:    []*framework.Secret{},
 		Invalidate: b.invalidate,
