@@ -11,6 +11,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/vault/sdk/logical"
+	cloudservicev1 "go.temporal.io/cloud-sdk/api/cloudservice/v1"
+	identityv1 "go.temporal.io/cloud-sdk/api/identity/v1"
+	operationv1 "go.temporal.io/cloud-sdk/api/operation/v1"
+	"go.temporal.io/cloud-sdk/cloudclient"
 
 	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
@@ -191,8 +195,16 @@ func TestLive_CredentialLifecycle(t *testing.T) {
 	b, storage := liveBackend(t)
 	name := acctestName(t)
 
+	// account_role=admin, not read: the probe below (GetServiceAccount) is an
+	// identity-management call, and Temporal Cloud restricts identity
+	// management to admin-role service accounts. A read-role key would fail
+	// this call with "permission denied" even though it authenticated fine —
+	// that is a property of the probe, not of what roles this engine
+	// supports. This says nothing about read-role keys in general; it is
+	// only about which Cloud Ops calls a read-role key may make. Do not
+	// "tidy" this back down to read.
 	createServiceAccount(t, b, storage, name, map[string]interface{}{
-		"account_role": "read",
+		"account_role": "admin",
 		"ttl":          "10m",
 		"max_ttl":      "1h",
 	})
@@ -222,7 +234,9 @@ func TestLive_CredentialLifecycle(t *testing.T) {
 	})
 
 	// The minted key must authenticate. Building a client with it and reading
-	// the admin service account is the cheapest proof.
+	// its own service account is the cheapest proof (identity management is
+	// admin-only, which is why the service account above was given
+	// account_role=admin).
 	minted, err := client.NewGRPC(client.Config{
 		APIKey:   token,
 		HostPort: os.Getenv("TEMPORAL_CLOUD_ADDRESS"),
@@ -233,8 +247,22 @@ func TestLive_CredentialLifecycle(t *testing.T) {
 	defer func() { _ = minted.Close() }()
 
 	saID, _ := resp.Data["service_account_id"].(string)
-	if _, err := minted.GetServiceAccount(context.Background(), saID); err != nil {
-		t.Fatalf("the minted key failed to authenticate: %v", err)
+
+	// Temporal Cloud may take a moment to propagate a freshly minted key to
+	// its auth layer — live testing observed the first call right after
+	// CreateApiKey's async operation completes fail with "request not
+	// authenticated" (Unauthenticated), not a permission error. Retry
+	// briefly rather than asserting once and flaking on propagation lag.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, err := minted.GetServiceAccount(context.Background(), saID)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the minted key failed to authenticate: %v", err)
+		}
+		time.Sleep(2 * time.Second)
 	}
 	t.Logf("minted key %s authenticated", keyID)
 
@@ -250,14 +278,14 @@ func TestLive_CredentialLifecycle(t *testing.T) {
 
 	// Temporal Cloud may take a moment to propagate the deletion, so retry
 	// briefly rather than asserting once and flaking.
-	deadline := time.Now().Add(30 * time.Second)
+	revokeDeadline := time.Now().Add(30 * time.Second)
 	for {
 		_, err := minted.GetServiceAccount(context.Background(), saID)
 		if err != nil {
 			t.Logf("revoked key correctly rejected: %v", err)
 			break
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(revokeDeadline) {
 			t.Fatal("the revoked key still authenticates after 30s")
 		}
 		time.Sleep(2 * time.Second)
@@ -360,30 +388,134 @@ func TestLive_KeyCapacity(t *testing.T) {
 	}
 }
 
-// TestLive_CountExcludesExpiredKeys was meant to settle the assumption behind
-// CountAPIKeys (see the comment there): that Temporal Cloud's GetApiKeys
-// response omits keys that no longer occupy one of the 20 slots, so counting
-// every returned key without filtering is correct rather than an ever-growing
-// overcount.
+// TestLive_CountDisabledKey proves the dangerous direction of CountAPIKeys'
+// no-filter design (see the comment there) does not happen: a DISABLED key
+// still occupies one of the 20 slots, and CountAPIKeys must still count it.
 //
-// It cannot do that anymore. The original approach minted a key with a
-// 2-minute expiry (bypassing creds/<name>, straight against the client, so
-// the expiry would not be clamped to the service account's max_ttl) and
-// polled CountAPIKeys until that expiry passed. Live testing found Temporal
-// Cloud rejects any expiry less than 24 hours from now (see
-// client.MinAPIKeyExpiry) — undocumented, discovered by this project's own
-// task-7 mint failures. A 2-minute expiry is no longer mintable at all, and
-// waiting out a real 24-hour expiry is not something a test suite should do
-// (this run has a 20-minute timeout).
-//
-// So the question CountAPIKeys' no-filter design depends on — does
-// GetApiKeys omit keys that have expired but not yet been deleted? — is
-// still open. It cannot be settled within a reasonable test run now that the
-// minimum expiry is a day. Skip rather than fabricate a pass.
-func TestLive_CountExcludesExpiredKeys(t *testing.T) {
-	t.Skip("cannot settle whether GetApiKeys excludes expired-but-undeleted keys: " +
-		"Temporal Cloud's undocumented 24-hour minimum expiry (client.MinAPIKeyExpiry) " +
-		"means a key can no longer be minted short-lived enough to expire within a " +
-		"reasonable test timeout. The question CountAPIKeys' no-filter design relies on " +
-		"remains open; see the comment on CountAPIKeys and on this test.")
+// An earlier version of this test tried to settle the other direction —
+// whether GetApiKeys omits keys that have merely expired but not yet been
+// deleted — by minting a short-lived key and waiting for it to expire. That
+// is no longer possible to test in seconds: Temporal Cloud rejects any
+// expiry less than 24 hours from now (see client.MinAPIKeyExpiry),
+// undocumented, discovered by this project's own task-7 mint failures. That
+// question is instead settled by reasoning in the CountAPIKeys comment: an
+// unfiltered count can only overcount if expired-but-undeleted keys are
+// returned, and overcounting just fails a mint early against our own
+// ceiling message — safe. This test covers the direction that IS testable
+// live and IS dangerous if wrong: filtering to RESOURCE_STATE_ACTIVE would
+// undercount, because a disabled key is not ACTIVE but still holds a slot.
+func TestLive_CountDisabledKey(t *testing.T) {
+	b, storage := liveBackend(t)
+	name := acctestName(t)
+
+	createServiceAccount(t, b, storage, name, map[string]interface{}{
+		"account_role": "read",
+		"ttl":          "10m",
+		"max_ttl":      "1h",
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/" + name,
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read creds: err=%v resp=%v", err, resp)
+	}
+
+	keyID, _ := resp.Data["api_key_id"].(string)
+	saID, _ := resp.Data["service_account_id"].(string)
+	if keyID == "" || saID == "" {
+		t.Fatalf("expected a key ID and service account ID, got %v", resp.Data)
+	}
+
+	// Delete the key immediately, not just at the end of the test: nothing
+	// below needs it to survive, so keep the cloud-side cleanup window as
+	// short as possible even if an assertion fails.
+	c, err := b.getClient(context.Background(), storage)
+	if err != nil {
+		t.Fatalf("get client: %v", err)
+	}
+	t.Cleanup(func() { _ = c.DeleteAPIKey(context.Background(), keyID) })
+
+	// Disabling isn't exposed on the CloudOps interface — the engine has no
+	// need for it — so reach the raw Cloud Ops API the same way the engine's
+	// own root credential does, using the admin API key from the
+	// environment.
+	raw, err := cloudclient.New(cloudclient.Options{
+		APIKey:   os.Getenv("TEMPORAL_CLOUD_API_KEY"),
+		HostPort: os.Getenv("TEMPORAL_CLOUD_ADDRESS"),
+	})
+	if err != nil {
+		t.Fatalf("building a raw cloudclient: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	svc := raw.CloudService()
+
+	got, err := svc.GetApiKey(context.Background(), &cloudservicev1.GetApiKeyRequest{KeyId: keyID})
+	if err != nil {
+		t.Fatalf("get api key: %v", err)
+	}
+	spec := got.GetApiKey().GetSpec()
+
+	// UpdateApiKey replaces the whole spec, so carry every existing field
+	// forward and flip only Disabled.
+	updResp, err := svc.UpdateApiKey(context.Background(), &cloudservicev1.UpdateApiKeyRequest{
+		KeyId: keyID,
+		Spec: &identityv1.ApiKeySpec{
+			OwnerId:     spec.GetOwnerId(),
+			OwnerType:   spec.GetOwnerType(),
+			DisplayName: spec.GetDisplayName(),
+			Description: spec.GetDescription(),
+			ExpiryTime:  spec.GetExpiryTime(),
+			Disabled:    true,
+		},
+		ResourceVersion: got.GetApiKey().GetResourceVersion(),
+	})
+	if err != nil {
+		t.Fatalf("disable api key: %v", err)
+	}
+
+	// Wait for the disable to actually take effect before asserting on it.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		op, err := svc.GetAsyncOperation(context.Background(), &cloudservicev1.GetAsyncOperationRequest{
+			AsyncOperationId: updResp.GetAsyncOperation().GetId(),
+		})
+		if err != nil {
+			t.Fatalf("poll disable operation: %v", err)
+		}
+		state := op.GetAsyncOperation().GetState()
+		if state == operationv1.AsyncOperation_STATE_FULFILLED {
+			break
+		}
+		if state == operationv1.AsyncOperation_STATE_FAILED ||
+			state == operationv1.AsyncOperation_STATE_CANCELLED ||
+			state == operationv1.AsyncOperation_STATE_REJECTED {
+			t.Fatalf("disable operation did not succeed: %s: %s", state, op.GetAsyncOperation().GetFailureReason())
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("disabling the key did not complete within 30s")
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	after, err := svc.GetApiKey(context.Background(), &cloudservicev1.GetApiKeyRequest{KeyId: keyID})
+	if err != nil {
+		t.Fatalf("get api key after disable: %v", err)
+	}
+	if !after.GetApiKey().GetSpec().GetDisabled() {
+		t.Fatalf("expected the key to be disabled, spec=%v", after.GetApiKey().GetSpec())
+	}
+	t.Logf("key %s confirmed disabled, state=%s", keyID, after.GetApiKey().GetState())
+
+	// The point of this test: a disabled key is not expired, so it must
+	// still be counted toward the 20-key ceiling.
+	count, err := c.CountAPIKeys(context.Background(), saID)
+	if err != nil {
+		t.Fatalf("count api keys: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected the disabled key to still be counted (count=1), got %d", count)
+	}
 }

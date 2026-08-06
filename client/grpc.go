@@ -154,19 +154,30 @@ func (c *grpcClient) CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey
 	return &APIKey{ID: resp.GetKeyId(), Token: resp.GetToken()}, nil
 }
 
-// DeleteAPIKey deliberately omits ResourceVersion, unlike UpdateServiceAccount
-// and DeleteServiceAccount above. KeyId already identifies exactly one key;
-// ResourceVersion only describes what state that key is in, so leaving it out
-// can't target the wrong key. API keys do mutate (see UpdateApiKey — Disabled,
-// DisplayName, Description, and ExpiryTime can all change and bump the
-// version), and the most likely mutation is an admin disabling a key they
-// suspect is compromised. Making revocation conditional on the version would
-// let that disable race ahead and make the delete fail, leaving the Vault
-// lease unable to revoke a credential it issued. Failing to revoke is worse
-// than clobbering a concurrent edit, so this call stays unconditional.
+// DeleteAPIKey fetches the current ResourceVersion immediately before
+// deleting, unlike the unconditional unversioned call an earlier version of
+// this method made.
+//
+// That earlier version omitted ResourceVersion on the theory that KeyId
+// alone already identifies exactly one key, so a version couldn't be needed
+// to target the right one. Live testing during Task 8 disproved that: the
+// Cloud Ops API rejects DeleteApiKey outright when ResourceVersion is empty,
+// with "invalid argument: invalid resource version" — the field is
+// mandatory, not merely an optional optimistic-concurrency check. So a
+// version must be supplied; the only choice left is how fresh. Fetching it
+// right here, right before the call (same pattern as DeleteServiceAccount
+// above), keeps the race window against a concurrent mutation — most likely
+// an admin disabling a key they suspect is compromised — as small as this
+// package can make it.
 func (c *grpcClient) DeleteAPIKey(ctx context.Context, id string) error {
+	got, err := c.svc.GetApiKey(ctx, &cloudservicev1.GetApiKeyRequest{KeyId: id})
+	if err != nil {
+		return MapGRPCError(err)
+	}
+
 	resp, err := c.svc.DeleteApiKey(ctx, &cloudservicev1.DeleteApiKeyRequest{
-		KeyId: id,
+		KeyId:           id,
+		ResourceVersion: got.GetApiKey().GetResourceVersion(),
 	})
 	if err != nil {
 		return MapGRPCError(err)
@@ -176,25 +187,25 @@ func (c *grpcClient) DeleteAPIKey(ctx context.Context, id string) error {
 }
 
 // CountAPIKeys counts every key GetApiKeys returns, with no filtering on
-// ApiKey.State.
+// ApiKey.State. This is deliberate, not an open question: the count is safe
+// in both directions it could be wrong.
 //
-// That is only correct if GetApiKeys itself omits keys that no longer occupy
-// one of the 20 slots — i.e. RESOURCE_STATE_EXPIRED and RESOURCE_STATE_DELETED
-// keys. A disabled/suspended key is NOT expired and still occupies a slot, so
-// filtering to RESOURCE_STATE_ACTIVE would undercount and let this engine
-// mint past the real ceiling, trading our actionable error for a raw
-// ResourceExhausted from the server. So if filtering is ever added here, it
-// must exclude only RESOURCE_STATE_EXPIRED/_DELETED and keep every other
-// state, disabled keys included.
+//   - If GetApiKeys already omits keys that no longer occupy one of the 20
+//     slots (RESOURCE_STATE_EXPIRED / _DELETED), this count is exact.
+//   - If it does not, this count OVERcounts. An overcount can only make a
+//     mint fail early against our own ceiling message — recoverable, and the
+//     operator is told exactly why.
 //
-// UNVERIFIED as of Task 8: nobody has confirmed empirically whether
-// GetApiKeys excludes expired keys, because the acceptance test that settles
-// it (TestLive_CountExcludesExpiredKeys in acceptance_test.go) has not yet
-// been run against a live account — see task-8-report.md. Until it has,
-// counting unfiltered (as below) is the deliberately safe choice: it can only
-// overcount, which fails a mint early with our own message, never undercount
-// past the real ceiling. Do not add ACTIVE-only filtering without first
-// running that test.
+// The alternative — filtering to RESOURCE_STATE_ACTIVE — risks the opposite,
+// worse failure: UNDERcounting. A disabled/suspended key is NOT
+// RESOURCE_STATE_ACTIVE but still occupies a slot (proved live by
+// TestLive_CountDisabledKey in acceptance_test.go, which disables a key and
+// asserts it is still counted). Filtering it out would let a mint slip past
+// the real ceiling and land on a raw ResourceExhausted from the server
+// instead of our actionable error. So: never filter to ACTIVE-only. If
+// filtering is ever added here, it must exclude only
+// RESOURCE_STATE_EXPIRED/_DELETED and keep every other state, disabled keys
+// included.
 func (c *grpcClient) CountAPIKeys(ctx context.Context, serviceAccountID string) (int, error) {
 	count := 0
 	pageToken := ""
