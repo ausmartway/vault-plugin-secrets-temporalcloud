@@ -27,6 +27,11 @@ type backend struct {
 	// than dialling per request.
 	clientMu sync.RWMutex
 	client   client.CloudOps
+
+	// newClient builds a Cloud Ops client. It is a field rather than a direct
+	// call to client.NewGRPC so tests can substitute a stub without dialling
+	// Temporal Cloud.
+	newClient func(cfg client.Config) (client.CloudOps, error)
 }
 
 // Factory is the entrypoint Vault calls to instantiate this plugin.
@@ -42,6 +47,8 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 // drive it directly.
 func Backend() *backend {
 	var b backend
+
+	b.newClient = client.NewGRPC
 
 	b.Backend = &framework.Backend{
 		Help:        strings.TrimSpace(backendHelp),
