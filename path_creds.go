@@ -93,6 +93,20 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 		ExpiryTime:       expiry,
 	})
 	if err != nil {
+		// CreateAPIKey returns what it minted even when the wait for the async
+		// operation failed, because Temporal Cloud may have completed the
+		// create regardless. No lease is being issued, so nothing will ever
+		// revoke that key: delete it here or it sits unusable in one of the
+		// service account's twenty slots until its expiry, which the
+		// MinAPIKeyExpiry floor puts at least a day out.
+		if key != nil && key.ID != "" {
+			if delErr := c.DeleteAPIKey(ctx, key.ID); delErr != nil {
+				b.Logger().Error(
+					"could not delete an API key whose creation did not complete; "+
+						"delete it by hand",
+					"api_key_id", key.ID, "service_account", name, "error", delErr)
+			}
+		}
 		return respondCloudErr(fmt.Sprintf("minting an API key for %q", name), err)
 	}
 

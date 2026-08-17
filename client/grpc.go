@@ -54,13 +54,21 @@ func (c *grpcClient) CreateServiceAccount(ctx context.Context, spec ServiceAccou
 		return "", MapGRPCError(err)
 	}
 
+	id := resp.GetServiceAccountId()
+
 	if err := awaitOperation(ctx, c.svc, resp.GetAsyncOperation()); err != nil {
 		// The ID is returned before the operation completes, so surface it:
 		// the caller may need it to clean up a half-created account.
-		return resp.GetServiceAccountId(), err
+		return id, err
 	}
 
-	return resp.GetServiceAccountId(), nil
+	// Read it back before claiming success: the caller's next move is to store
+	// this ID and mint keys against it.
+	if err := c.confirmServiceAccountExists(ctx, id); err != nil {
+		return id, err
+	}
+
+	return id, nil
 }
 
 func (c *grpcClient) GetServiceAccount(ctx context.Context, id string) (*ServiceAccount, error) {
@@ -123,7 +131,14 @@ func (c *grpcClient) DeleteServiceAccount(ctx context.Context, id string) error 
 		return MapGRPCError(err)
 	}
 
-	return awaitOperation(ctx, c.svc, resp.GetAsyncOperation())
+	if err := awaitOperation(ctx, c.svc, resp.GetAsyncOperation()); err != nil {
+		return err
+	}
+
+	// Deleting a service account invalidates every API key it owns, so the
+	// caller is entitled to treat this returning nil as those keys being dead.
+	// Prove it rather than infer it from the operation state.
+	return c.confirmServiceAccountGone(ctx, id)
 }
 
 func (c *grpcClient) CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey, error) {
@@ -145,11 +160,30 @@ func (c *grpcClient) CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey
 	}
 
 	if err := awaitOperation(ctx, c.svc, resp.GetAsyncOperation()); err != nil {
-		return nil, err
+		// Surface what was minted anyway, mirroring CreateServiceAccount
+		// above. CreateApiKey has already been accepted at this point, so the
+		// operation may still land FULFILLED server-side and leave a real key
+		// occupying one of the service account's twenty slots. The token is on
+		// this response and is never retrievable again, so discarding it here
+		// would strand that key: unusable, uncountable by the caller, and
+		// alive until its expiry. Callers must treat a non-nil key alongside a
+		// non-nil error as something to clean up, not something to hand out.
+		return &APIKey{ID: resp.GetKeyId(), Token: resp.GetToken()}, err
 	}
 
 	// The token is on the create response and is never retrievable again.
-	return &APIKey{ID: resp.GetKeyId(), Token: resp.GetToken()}, nil
+	key := &APIKey{ID: resp.GetKeyId(), Token: resp.GetToken()}
+
+	// Read the key back before handing out its token. A token for a key
+	// Temporal Cloud will not admit to having is one the caller would put
+	// under a Vault lease and hand to a workload that then cannot connect.
+	// The key is returned alongside the error for the same reason as above:
+	// it may exist and need cleaning up.
+	if err := c.confirmAPIKeyExists(ctx, key.ID); err != nil {
+		return key, err
+	}
+
+	return key, nil
 }
 
 // DeleteAPIKey fetches the current ResourceVersion immediately before
@@ -181,7 +215,37 @@ func (c *grpcClient) DeleteAPIKey(ctx context.Context, id string) error {
 		return MapGRPCError(err)
 	}
 
-	return awaitOperation(ctx, c.svc, resp.GetAsyncOperation())
+	if err := awaitOperation(ctx, c.svc, resp.GetAsyncOperation()); err != nil {
+		// A delete operation can land terminally failed for a reason that is
+		// not a failure at all from the caller's point of view: the key was
+		// already gone, deleted out of band inside the window between the
+		// GetApiKey above and this operation completing.
+		// classifyOperationState reports every terminal failure as
+		// ErrInvalidArgument, and the revoke path (secret_api_key.go) treats
+		// only ErrNotFound as success — so without this check Vault would
+		// retry that lease revocation on its backoff schedule forever.
+		//
+		// Asking whether the key still exists is the only way to tell the two
+		// apart, and it costs one extra call on a path that has already
+		// failed. If it is gone, report the outcome the caller actually cares
+		// about. If it is still there, or we cannot tell, the original error
+		// stands and the retry is correct.
+		//
+		// This asks once rather than polling: the operation has already
+		// failed, so there is no pending change to wait for, and making the
+		// caller sit through confirmTimeout before reporting a failure it
+		// could act on immediately would be worse than useless.
+		if gone, goneErr := c.apiKeyGone(ctx, id); goneErr == nil && gone {
+			return fmt.Errorf("%w: api key %s was already deleted", ErrNotFound, id)
+		}
+		return err
+	}
+
+	// The operation says the key is deleted. Check, because this is the claim
+	// with the worst failure mode in the engine: the caller (secret_api_key.go)
+	// drops the Vault lease on the strength of it, and a key that survives that
+	// is a live Temporal Cloud credential nothing is tracking any more.
+	return c.confirmAPIKeyGone(ctx, id)
 }
 
 // CountAPIKeys counts every key GetApiKeys returns, with no filtering on

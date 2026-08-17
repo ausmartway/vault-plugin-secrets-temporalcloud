@@ -28,8 +28,10 @@ type config struct {
 	APIKey string `json:"api_key"`
 
 	// APIKeyID identifies APIKey so rotate-root can delete the key it
-	// replaces. Optional, because the bootstrap key's ID cannot be derived
-	// from its token.
+	// replaces. Read-only from an operator's point of view: it is derived
+	// from APIKey, which carries its own ID (see client.APIKeyIDFromToken),
+	// so it always describes the key actually stored. Empty only when a
+	// token could not be parsed, which is warned about at write time.
 	APIKeyID string `json:"api_key_id"`
 
 	// AdminServiceAccountID owns APIKey. Required because the Cloud Ops API
@@ -56,10 +58,14 @@ func (b *backend) pathConfig() *framework.Path {
 					Sensitive: true,
 				},
 			},
-			"api_key_id": {
-				Type:        framework.TypeString,
-				Description: "ID of the API key given in api_key. Optional; lets rotate-root delete the key it replaces.",
-			},
+			// api_key_id is deliberately absent from this list: it is
+			// read-only, returned on read but never accepted on write. The
+			// engine reads it out of api_key itself — a Temporal Cloud API key
+			// is a JWT carrying its own id in the key_id claim — so there is
+			// nothing for an operator to supply, and a supplied value could
+			// only ever disagree with the key it claims to name. Since
+			// rotate-root deletes whatever this ID names, letting the two
+			// disagree is a way to destroy an unrelated key by typo.
 			"admin_service_account_id": {
 				Type:        framework.TypeString,
 				Description: "ID of the service account that owns api_key. Required: the Cloud Ops API cannot report a token's owner.",
@@ -101,6 +107,20 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse("api_key is required"), nil
 	}
 
+	// api_key_id is read-only, and the framework will not police that for us:
+	// FieldData.Validate skips fields absent from the schema rather than
+	// rejecting them, so a supplied value would be dropped in silence — the
+	// worst outcome, because the operator would believe they had configured
+	// rotate-root's cleanup when they had not. Say so instead.
+	if _, ok := d.Raw["api_key_id"]; ok {
+		return logical.ErrorResponse(
+			"api_key_id is read-only and cannot be set. Vault reads it from api_key " +
+				"itself, which carries its own ID, so there is nothing to supply — and " +
+				"a supplied value could only disagree with the key it names, which " +
+				"matters because config/rotate-root deletes whatever it names. Remove " +
+				"the field and write again; 'vault read' will show the ID Vault derived."), nil
+	}
+
 	adminSAID := d.Get("admin_service_account_id").(string)
 	if adminSAID == "" {
 		return logical.ErrorResponse(
@@ -108,7 +128,27 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 				"identity owns an API key, and rotate-root must mint against that identity"), nil
 	}
 
-	rootKeyTTL := time.Duration(d.Get("root_key_ttl").(int)) * time.Second
+	existing, err := b.getConfig(ctx, req.Storage)
+	if err != nil {
+		return nil, err
+	}
+
+	// address and root_key_ttl merge against the stored config on update, the
+	// same way service-accounts/<name> merges: omitting a field means "leave
+	// it alone," not "reset it to the default." Both carry framework defaults,
+	// so without this a write that changes only the credential would silently
+	// revert a PrivateLink address to the public endpoint and a tuned
+	// root_key_ttl to 90 days. d.GetOk reports whether the field was in the
+	// request at all, which is the only way to tell absent from zero.
+	_, addressSet := d.GetOk("address")
+	_, rootKeyTTLSet := d.GetOk("root_key_ttl")
+
+	var rootKeyTTL time.Duration
+	if existing != nil && !rootKeyTTLSet {
+		rootKeyTTL = existing.RootKeyTTL
+	} else {
+		rootKeyTTL = time.Duration(d.Get("root_key_ttl").(int)) * time.Second
+	}
 	if rootKeyTTL <= 0 {
 		rootKeyTTL = defaultRootKeyTTL
 	}
@@ -132,20 +172,52 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 			rootKeyTTL, client.MinAPIKeyExpiry), nil
 	}
 
+	address := d.Get("address").(string)
+	if existing != nil && !addressSet {
+		address = existing.Address
+	}
+	if address == "" {
+		address = defaultAddress
+	}
+
+	// api_key_id is derived from the key itself, never supplied and never
+	// carried over from a previous write. A Temporal Cloud API key is a JWT
+	// whose payload names its own id, so the value is right by construction:
+	// it came from the very token being stored, and cannot drift out of step
+	// with it the way a remembered or hand-entered one could.
+	//
+	// A key this cannot parse is rejected rather than stored with an unknown
+	// id. Storing it would produce a mount that works until the day it has to
+	// rotate, and then strands the key it was supposed to replace — a failure
+	// deferred to the least convenient moment, and one the operator would have
+	// forgotten agreeing to. Every real Temporal Cloud API key parses, so the
+	// realistic causes are a truncated paste or the wrong string entirely,
+	// both of which the operator wants to hear about now.
+	apiKeyID, err := client.APIKeyIDFromToken(apiKey)
+	if err != nil {
+		return logical.ErrorResponse(
+			"api_key does not look like a Temporal Cloud API key: %s. A Temporal Cloud "+
+				"API key is a JWT that carries its own key ID, which this engine reads so "+
+				"config/rotate-root can delete the key it replaces. Check that the whole "+
+				"key was pasted, and that it is an API key rather than a namespace "+
+				"certificate or an account ID.", err), nil
+	}
+
 	cfg := &config{
 		APIKey:                apiKey,
-		APIKeyID:              d.Get("api_key_id").(string),
+		APIKeyID:              apiKeyID,
 		AdminServiceAccountID: adminSAID,
-		Address:               d.Get("address").(string),
+		Address:               address,
 		RootKeyTTL:            rootKeyTTL,
-	}
-	if cfg.Address == "" {
-		cfg.Address = defaultAddress
 	}
 
 	// Validate before persisting. One GetServiceAccount call proves both that
 	// the key authenticates and that admin_service_account_id is correct, so
 	// the operator learns about a mistake now rather than at first use.
+	// Built from cfg, not from the cached client and not from `existing`: the
+	// credential under test must be the one this write is about to store, or
+	// an update would validate whatever the mount is already using and accept
+	// any key at all. TestConfig_ValidatesTheKeyBeingWritten pins this.
 	c, err := b.newClient(cfg.clientConfig())
 	if err != nil {
 		return logical.ErrorResponse("could not build a Temporal Cloud client: %s", err), nil
@@ -250,6 +322,25 @@ accounts and their API keys. It must be a service-account key rather than a user
 key: Temporal Cloud's CreateApiKey supports service-account owners only, so a
 user-owned key could not be rotated by this engine.
 
+Updating merges against what is already stored: address and root_key_ttl keep
+their current values when omitted, so a write that only swaps the credential
+does not quietly revert them to defaults. api_key and admin_service_account_id
+are required on every write.
+
+Nothing is stored until the credential has been proven to work. The key is
+parsed first, then used: one GetServiceAccount call on admin_service_account_id
+proves both that the key authenticates and that the ID is real and readable by
+it. A key that fails either step is rejected and nothing is persisted.
+
+api_key_id is read-only: returned by a read, rejected on a write. A Temporal
+Cloud API key is a JWT that names its own ID, so Vault reads the ID out of
+api_key rather than asking for it. That means it always describes the key
+actually in use, and rotate-root can always delete the key it replaces —
+including a key an operator pasted in by hand. A key whose ID cannot be read is
+rejected rather than stored: it would give you a mount that works until the day
+it has to rotate, and then strands the key it was meant to replace.
+
 After writing this path, run "config/rotate-root" so Vault replaces the
-bootstrap key with one only it holds.
+bootstrap key with one that has never existed outside Vault. The pasted key is
+deleted as part of that.
 `
