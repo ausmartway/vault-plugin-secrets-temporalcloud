@@ -322,6 +322,43 @@ func TestCreds_UnavailableStaysAGoError(t *testing.T) {
 	}
 }
 
+// A mint that fails after Temporal Cloud already accepted the create leaves a
+// real key behind — CreateAPIKey returns it alongside the error for exactly
+// this reason. No lease is issued, so nothing will ever revoke it: the handler
+// must delete it, or it sits unusable in one of the service account's twenty
+// slots until its expiry, which the 24-hour floor puts at least a day out.
+func TestCreds_DeletesKeyWhenMintDoesNotComplete(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{
+		createAPIKeyFn: func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+			return &client.APIKey{ID: "key-orphan", Token: "tmprl_sk_real"},
+				fmt.Errorf("%w: operation failed", client.ErrInvalidArgument)
+		},
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{"account_role": "read"})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if resp == nil || !resp.IsError() {
+		t.Fatalf("expected an error response, got %v", resp)
+	}
+	if resp.Secret != nil {
+		t.Error("expected no lease for a mint that did not complete")
+	}
+
+	if len(stub.deletedAPIKeys) != 1 || stub.deletedAPIKeys[0] != "key-orphan" {
+		t.Errorf("expected the orphaned key to be deleted, got %v", stub.deletedAPIKeys)
+	}
+}
+
 func TestCreds_UnknownServiceAccount(t *testing.T) {
 	b, storage := newTestBackend(t)
 	withStubClient(b, &stubCloudOps{})

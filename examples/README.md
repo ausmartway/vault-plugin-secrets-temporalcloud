@@ -15,22 +15,21 @@ Cloud Ops API call.
   need to be long-lived.
 
 ```bash
-export TEMPORAL_CLOUD_API_KEY="tcld_..."
-export TEMPORAL_CLOUD_ADMIN_SA_ID="svcacct-..."
-
-# Optional, but set it if you can — see below.
-export TEMPORAL_CLOUD_API_KEY_ID="apikey-..."
+export TEMPORAL_CLOUD_API_KEY="eyJhbGciOiJFUzI1NiIs..."
+export TEMPORAL_CLOUD_ADMIN_SA_ID="<service account id>"
 ```
 
-**Set `TEMPORAL_CLOUD_API_KEY_ID` if you want step 2 to land.** It is the ID
-of the bootstrap key itself, shown next to the key in Settings → API Keys.
-Without it, Vault has no way to know which key to delete when it rotates: an
-API key token does not carry its own ID, and the Cloud Ops API has no call
-that maps one to the other. Rotation still succeeds — Vault starts using a key
-it minted itself — but it warns you, and the key you pasted stays valid until
-you delete it by hand. That is a real behaviour worth showing a customer, but
-show it deliberately, not by accident: with the ID set, the demo tells the
-whole story of the bootstrap credential being destroyed.
+**Step 2 deletes the key you pasted in step 1, and that is the moment worth
+narrating.** Have Settings → API Keys open on screen while it runs: the key you
+pasted disappears and a `vault-root-<timestamp>` key takes its place. From that
+point no working root credential exists outside Vault.
+
+Vault knows which key to delete because a Temporal Cloud API key is a JWT that
+carries its own `key_id` claim, so the engine reads the ID straight out of the
+key you handed it. Nobody looks anything up, and there is no window where the
+human-held credential outlives its replacement. If someone asks how it knows,
+decoding the middle segment of any API key on screen answers it in about ten
+seconds.
 
 ## Running it
 
@@ -58,7 +57,7 @@ export VAULT_TOKEN=root
 | Step | What happens | Where to look |
 | --- | --- | --- |
 | 1. Configure | Vault stores the bootstrap API key and validates it by reading the admin service account | Settings → API Keys — your pasted key is still there |
-| 2. Rotate root | Vault mints a fresh key on the admin service account, verifies it works, stores it, and deletes the one you pasted — if it was told that key's ID | Settings → API Keys — a key named `vault-root-<timestamp>` appears. With `TEMPORAL_CLOUD_API_KEY_ID` set, the key from step 1 is gone; without it, that key is still listed and Vault warns you to delete it yourself |
+| 2. Rotate root | Vault mints a fresh key on the admin service account, verifies it works, stores it, and deletes the one you pasted — whose ID it read out of the key itself | Settings → API Keys — a key named `vault-root-<timestamp>` appears and the key from step 1 is gone. Rotate again and watch the same thing happen to the `vault-root-*` key |
 | 3. Create service account | Vault creates `demo-workers` with `read` account access | Settings → Identities — a new service account named `demo-workers` |
 | 4. Read a credential | Vault mints an API key on `demo-workers` and hands it back once, under a 5-minute lease | Settings → API Keys — a key named `vault-demo-workers-<random>` appears |
 | 5. Show the lease | `vault list` on `sys/leases/lookup` — nothing Temporal Cloud–side, just showing Vault's bookkeeping | — |

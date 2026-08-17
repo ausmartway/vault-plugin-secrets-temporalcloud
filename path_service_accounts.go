@@ -266,6 +266,21 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 			// The name is free — create it, which is the ordinary path.
 			id, err := c.CreateServiceAccount(ctx, spec)
 			if err != nil {
+				// CreateServiceAccount deliberately returns the new ID even
+				// when the wait for the async operation failed, because the
+				// account may exist in Temporal Cloud regardless. Use it:
+				// a half-created account holds the name, so leaving it there
+				// makes every retry of this write collide with a service
+				// account the operator never asked for and cannot find by
+				// name in Vault.
+				if id != "" {
+					if delErr := c.DeleteServiceAccount(ctx, id); delErr != nil {
+						b.Logger().Error(
+							"could not delete a service account whose creation did not "+
+								"complete; delete it by hand",
+							"service_account_id", id, "name", name, "error", delErr)
+					}
+				}
 				return respondCloudErr(
 					fmt.Sprintf("creating service account %q in Temporal Cloud", name), err)
 			}
@@ -280,6 +295,14 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 
 	default:
 		entry.ServiceAccountID = existing.ServiceAccountID
+
+		// Adoption records how this binding came to exist, so it is carried
+		// forward rather than re-derived: entry is rebuilt from the request on
+		// every write, and force is read fresh, so without this an ordinary
+		// update clears the flag. That matters because Adopted is the only
+		// signal telling an operator that Vault manages an account it did not
+		// create — and that deleting this entry destroys it anyway.
+		entry.Adopted = existing.Adopted
 
 		// Only call Temporal Cloud if something it knows about changed. TTLs
 		// are a Vault-side concern, so a TTL-only edit needs no API call.

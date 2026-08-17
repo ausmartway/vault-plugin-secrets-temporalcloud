@@ -1,69 +1,71 @@
 # vault-plugin-secrets-temporalcloud
 
-A HashiCorp Vault secrets engine that issues short-lived Temporal Cloud API
-keys as Vault dynamic secrets. It provisions Temporal Cloud service accounts,
-mints API keys bound to Vault leases, and deletes each key the moment its
-lease ends.
+A HashiCorp Vault secrets engine that turns Temporal Cloud API keys into Vault
+dynamic secrets. It provisions Temporal Cloud service accounts, mints API keys
+bound to Vault leases, and deletes each key the moment its lease ends.
 
-This has been proven against a real Temporal Cloud account — every path below
-is exercised by a live acceptance test suite, not mocked out.
+This document is for the Vault administrator who installs, configures, and
+operates the mount. For changing the plugin itself, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-## The problem
+Every path below is exercised against a real Temporal Cloud account by a live
+acceptance suite, not only against mocks.
 
-Temporal Cloud API keys are a static credential with a few sharp edges:
+## Why run this
 
-- The token is shown **once**, at creation. If you lose it, you cannot
-  retrieve it — you delete the key and mint another.
+Temporal Cloud API keys are static credentials with a few sharp edges:
+
+- The token is shown **once**, at creation. Lose it and your only option is to
+  delete the key and mint another.
 - Every key **must** expire, with a maximum lifetime of two years. Nothing is
   permanent, so someone has to rotate every key eventually.
-- Rotating one by hand is a four-step dance: mint the replacement, wire it
-  into whatever holds the old one, verify the new one works, delete the old
-  one. Skip step three and you can lock yourself out; skip step four and the
-  old key lingers as a standing credential nobody is watching.
+- Rotating one by hand is a four-step dance: mint the replacement, wire it into
+  whatever holds the old one, verify the new one works, delete the old one.
+  Skip step three and you can lock yourself out; skip step four and the old key
+  lingers as a standing credential nobody is watching.
 - The key has no lifecycle tie to the workload using it. A worker that gets
-  torn down does not take its API key down with it — the key just sits there,
-  valid, until someone remembers to clean it up.
+  torn down does not take its API key with it — the key sits there, valid,
+  until someone remembers it.
 
-Vault's dynamic-secrets model solves exactly this: a credential minted for a
-lease, and deleted when that lease ends. This engine puts Temporal Cloud API
-keys behind that model.
+Vault's dynamic-secrets model answers exactly this: a credential minted for a
+lease, deleted when that lease ends. This engine puts Temporal Cloud API keys
+behind that model, so the credential a workload holds is short-lived,
+attributable, and revocable from Vault.
 
-## Quick start
+## Before you start
 
-```bash
-make dev
-```
+You need:
 
-builds the plugin and starts Vault in `-dev` mode with it mounted at
-`temporalcloud/`. In another terminal, with `TEMPORAL_CLOUD_API_KEY` and
-`TEMPORAL_CLOUD_ADMIN_SA_ID` set to a Global-Admin-owned service account key:
+- **A Vault server** you can register external plugins on: a configured
+  `plugin_directory`, and permission to run `vault plugin register`.
+- **A Temporal Cloud API key owned by a service account** with the Global Admin
+  (or Account Owner) role, plus that service account's ID.
 
-```bash
-export VAULT_ADDR=http://127.0.0.1:8200
-export VAULT_TOKEN=root
-./examples/demo.sh
-```
+Two things about that credential are worth getting right up front, because both
+are awkward to change later:
 
-walks the full lifecycle: configure, rotate the bootstrap key away, create a
-service account, mint a credential, revoke it, tear down. Also set
-`TEMPORAL_CLOUD_API_KEY_ID` to the bootstrap key's own ID if you have it —
-without it the rotation step cannot delete the key you pasted, and says so.
-See [`examples/README.md`](examples/README.md) for what to look at in the
-Temporal Cloud UI at each step.
+> **It must be a service-account key, not a user key.** Temporal Cloud's
+> `CreateApiKey` only supports service-account owners, so there is no way to
+> mint a replacement for a user identity. Hand this engine a user-owned key and
+> `rotate-root` has nothing it can do.
+>
+> **Treat the key you paste in as disposable.** The first thing you will do
+> after configuring the mount is rotate it away, which deletes it. That is the
+> point: from then on, no working root credential has ever existed outside
+> Vault.
 
-## Installing a release
+## Install
 
-`make dev` is for demos. On a real Vault server, install a built release.
-
-Grab the archive for your platform from the
+Download the archive for your platform from the
 [releases page](https://github.com/ausmartway/vault-plugin-secrets-temporalcloud/releases).
+
 **There are two different checksums involved, and confusing them is the usual
 reason registration fails.** The published `_SHA256SUMS` file covers the
 *archives* and proves your download arrived intact. Vault instead verifies the
 hash of the *extracted binary*.
 
 ```bash
-VERSION=0.0.1
+VERSION=0.1.0
 OS=linux ARCH=amd64                       # or darwin / arm64
 
 # 1. verify the download
@@ -79,99 +81,92 @@ SHA=$(shasum -a 256 "$VAULT_PLUGIN_DIR/vault-plugin-secrets-temporalcloud" \
     | cut -d' ' -f1)
 vault plugin register -sha256="$SHA" \
     secret vault-plugin-secrets-temporalcloud
+
 vault secrets enable -path=temporalcloud vault-plugin-secrets-temporalcloud
 ```
 
-Vault gives you no way to ask a registered plugin which build it is running, so
-if you need to confirm what landed in the plugin directory, ask the binary:
+Binaries are statically linked (`CGO_ENABLED=0`), so they do not depend on the
+Vault host's libc.
+
+**Confirming what you installed.** Vault gives you no way to ask a registered
+plugin which build it is running, so ask the binary directly:
 
 ```bash
 ./vault-plugin-secrets-temporalcloud --version
 ```
 
-Releases are built by [GoReleaser](https://goreleaser.com) from a git tag, for
-linux and darwin on amd64 and arm64, statically linked (`CGO_ENABLED=0`) so the
-binary does not depend on the Vault host's libc. To cut one:
+**Upgrading.** Replace the binary, re-register with the new hash, then reload:
 
 ```bash
-make release-check                        # validate .goreleaser.yaml
-make snapshot                             # build locally into dist/, publish nothing
-git tag -a v0.1.0 -m "..." && git push origin v0.1.0
-GITHUB_TOKEN=$(gh auth token) make release
+vault plugin register -sha256="$NEW_SHA" \
+    secret vault-plugin-secrets-temporalcloud
+vault plugin reload -plugin=vault-plugin-secrets-temporalcloud
 ```
 
-## Paths
+Stored configuration and service-account definitions survive an upgrade.
+Outstanding leases survive too, and remain revocable.
 
-### `config`
+## Configure
 
-Write-once-then-update configuration: the root credential and how to reach
-Temporal Cloud.
-
-| Field | Description |
-| --- | --- |
-| `api_key` | Required. A Temporal Cloud API key owned by a service account with the Global Admin (or Account Owner) role. Never returned by a read. |
-| `admin_service_account_id` | Required. The ID of the service account that owns `api_key`. The Cloud Ops API has no "whoami" call — given only a token, there is no way to discover which identity it belongs to, and `rotate-root` needs that identity to mint a replacement. |
-| `api_key_id` | Optional. The ID of the key given in `api_key`, so `rotate-root` can delete the key it replaces. Not knowable for a hand-issued bootstrap key unless you looked it up yourself. |
-| `address` | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`. Override for PrivateLink or non-production endpoints. |
-| `root_key_ttl` | Expiry applied to keys minted by `rotate-root`. Defaults to 90 days. Minimum 24 hours, maximum two years — Temporal Cloud enforces both, and a value outside them is rejected here at write time rather than by Temporal Cloud at rotation time. The 24-hour minimum is undocumented by Temporal Cloud; the usual way to run into it is setting a short `root_key_ttl` to demo rotation quickly. |
-
-Writing `config` validates the credential immediately by calling
-`GetServiceAccount` on `admin_service_account_id` — you find out now if the
-key is wrong or the ID doesn't match, not on the first `creds/` read.
+### 1. Write the root credential
 
 ```bash
 vault write temporalcloud/config \
-    api_key="tcld_..." \
-    admin_service_account_id="svcacct-abc123"
+    api_key="eyJhbGciOiJFUzI1NiIs..." \
+    admin_service_account_id="<service account id>"
 ```
 
-**The root credential must be a service-account key, not a user key.**
-Temporal Cloud's `CreateApiKey` call only supports service-account owners —
-there is no way to mint a replacement key for a user identity. If you hand
-this engine a user-owned key, `rotate-root` has nothing it can do, so use a
-service account from the start.
+`admin_service_account_id` is required because the Cloud Ops API has no
+"whoami" call — given only a token, there is no way to discover which identity
+it belongs to, and rotation needs that identity to mint a replacement.
 
-### `config/rotate-root`
+**Nothing is stored until the credential has been proven to work.** The write
+is checked in two stages and fails at whichever comes first:
 
-Write-only, no fields. Mints a new API key on the configured admin service
-account, verifies the new key actually works (by reading the admin service
-account with it), stores it as the credential, then deletes the key it
-replaced.
+1. **The key is parsed.** A Temporal Cloud API key is a JWT; the engine reads
+   the key's own ID out of it. A key it cannot parse is rejected.
+2. **The key is used.** The engine dials Temporal Cloud and reads
+   `admin_service_account_id` back. That single call proves both that the key
+   authenticates and that the ID is real and readable by it.
+
+Only then is anything persisted. A wrong key, an expired key, a key whose
+service account lacks Global Admin, or a mistyped `admin_service_account_id`
+all fail at write time with a message naming which — never silently, and never
+on some later credential request. A rejected update leaves the previous
+configuration exactly as it was, so a bad write cannot break a working mount.
+
+### 2. Rotate it immediately
 
 ```bash
 vault write -f temporalcloud/config/rotate-root
 ```
 
-Run this immediately after the first `config` write. Doing so means the
-bootstrap key you pasted by hand is destroyed, and the only working root
-credential from that point on is one that has never existed outside Vault.
+This mints a new key on the admin service account, verifies it works, stores
+it, and **deletes the key you pasted**. Run it as part of setup, not as a
+later chore: until you do, a working root credential exists in your shell
+history, your terminal scrollback, and wherever you copied it from.
 
-The ordering inside `rotate-root` is deliberate: verify before storing means a
-non-working key never becomes the stored credential; store before deleting
-means a failure at the last step leaves two working keys rather than zero.
-Every intermediate failure leaves the mount usable — worst case you get a
-warning that the old key needs manual cleanup, never a bricked mount.
+The ordering inside rotation is deliberate and worth knowing when something
+goes wrong: verify before storing means a non-working key never becomes the
+stored credential; store before deleting means a failure at the last step
+leaves two working keys rather than none. Every intermediate failure leaves the
+mount usable — worst case you get a warning that a key needs manual cleanup,
+never a bricked mount.
 
-> **Every Temporal Cloud API key expires — including Vault's own.**
-> Re-run `config/rotate-root` before `root_key_ttl` (default 90 days)
-> elapses. If it expires anyway, the mount stops issuing anything until an
-> operator writes `config` again with a fresh, hand-made key. There is no
-> automatic recovery from a root key that has actually expired — this engine
-> cannot mint a replacement for a key it no longer has one that works.
+> ### Put the next rotation in your calendar
+>
+> **Every Temporal Cloud API key expires — including Vault's own.** Re-run
+> `config/rotate-root` well before `root_key_ttl` (default 90 days) elapses.
+>
+> If it expires anyway, the mount stops issuing credentials until an operator
+> writes `config` again with a fresh, hand-made key. **There is no automatic
+> recovery**: the engine cannot mint a replacement for a key when it no longer
+> holds one that works. Rotation is safe to run early and as often as you like.
 
-### `service-accounts/<name>`
+## Define a service account
 
-Defines a Temporal Cloud service account and the credential policy for keys
-issued from it.
-
-| Field | Description |
-| --- | --- |
-| `account_role` | Required on every write. One of `owner`, `admin`, `developer`, `finance-admin`, `read`, `metrics-read`. |
-| `namespace_access` | Namespace permissions as `namespace=permission` pairs (`admin`, `write`, or `read`), e.g. `prod.acct1=write,staging.acct1=read`. |
-| `description` | Shown in the Temporal Cloud UI. Defaults to `Managed by Vault mount <mount>`. |
-| `ttl` | Default Vault lease TTL for keys issued here. Defaults to 1 hour. |
-| `max_ttl` | Maximum lease TTL. Also drives the key's Temporal Cloud-side expiry (see below). Defaults to 24 hours. |
-| `force` | Only meaningful on create. If a service account with this name already exists in Temporal Cloud, adopt it instead of failing. See below. |
+Each `service-accounts/<name>` entry is one Temporal Cloud service account plus
+the credential policy for keys issued from it.
 
 ```bash
 vault write temporalcloud/service-accounts/prod-workers \
@@ -180,134 +175,86 @@ vault write temporalcloud/service-accounts/prod-workers \
     ttl=15m max_ttl=8h
 ```
 
+Writing this **creates the service account in Temporal Cloud**. Reading the
+entry back shows what Vault has stored, including whether the account was
+adopted rather than created:
+
 ```bash
 vault read temporalcloud/service-accounts/prod-workers
 ```
 
-Deleting the entry deletes the service account in Temporal Cloud, which
-invalidates every API key it owns. **Revoke the outstanding leases first:**
+### Two behaviours that surprise people
 
-```bash
-vault lease revoke -prefix temporalcloud/creds/prod-workers
-vault delete temporalcloud/service-accounts/prod-workers
-```
+Both change live state in Temporal Cloud, not just what Vault has stored.
 
-Deleting the entry while leases are still outstanding leaves those leases
-pointing at API keys whose owning service account no longer exists. Vault will
-still revoke them on schedule, and revocation is written to treat an
-already-absent key as success — but that specific path (revoking a key whose
-service account was deleted out from under it) has never been observed against
-a live account, so it is not a path to rely on. Revoking first keeps teardown
-on behaviour that has been proven.
-
-#### Write semantics — read this before you write here
-
-Two behaviours on this path surprise people, and both of them change live
-state in Temporal Cloud, not just what Vault has stored.
-
-**Create requires the full spec. Update merges.** The first write for a
-name needs `account_role` at minimum. Every write after that only changes the
-fields you actually pass — a field you omit keeps its previously stored
-value. So:
+**Create requires the spec; update merges.** The first write needs
+`account_role` at minimum. Every write after that changes only the fields you
+pass — omit one and it keeps its stored value. So this changes the role and
+nothing else:
 
 ```bash
 vault write temporalcloud/service-accounts/prod-workers account_role=admin
 ```
 
-changes only the role; `namespace_access`, `ttl`, `max_ttl`, and
-`description` stay exactly what they were. `namespace_access` needs special
-handling because "omitted" and "empty" both look like nothing was passed —
-`vault write` gives the field no way to distinguish "don't touch this" from
-"clear it out." The engine resolves that by checking whether the field was
-present in the request at all: omit it entirely to leave namespace access
-untouched; pass it explicitly as an empty string to clear it:
+`namespace_access` needs care, because "omitted" and "empty" look the same to
+`vault write`. Omit it entirely to leave namespace permissions untouched; pass
+it explicitly as an empty string to clear them:
 
 ```bash
 vault write temporalcloud/service-accounts/prod-workers namespace_access=""
 ```
 
-That reaches Temporal Cloud and revokes every namespace permission the
-service account had. It is not a Vault-only bookkeeping change.
+That reaches Temporal Cloud and revokes every namespace permission the account
+had. It is not a Vault-side bookkeeping change.
 
-**Creating a name that collides fails, unless you force it.** Temporal Cloud
-requires service-account names to be unique across all active accounts. If
-you write a name that already exists there — created by someone else, by a
-previous mount, by hand in the console — the write fails and names the
-colliding account's ID:
+**A name that already exists in Temporal Cloud fails, unless you force it.**
+Service-account names are unique across active accounts. If the name is taken —
+by a colleague, a previous mount, or something made by hand in the console —
+the write fails and names the colliding account's ID. `force=true` adopts that
+account instead: Vault binds its entry to it and overwrites its permissions
+with your specification.
 
-```
-a service account named "prod-workers" already exists in Temporal Cloud (id svcacct-xyz) and
-Vault did not create it. Either choose a different name, or re-run with force=true to have Vault
-adopt that account and reset its permissions to this specification.
-```
+> **An adopted account becomes fully Vault-managed, exactly as if Vault had
+> created it.** `vault delete` on that entry deletes the service account in
+> Temporal Cloud, invalidating every API key it owns. Adopt a colleague's
+> service account and you have handed Vault the ability to destroy it.
+> `vault read` shows `adopted: true` so this stays visible afterwards, but
+> nothing stops the delete.
 
-`force=true` adopts it: Vault binds its own entry to that existing account
-and immediately overwrites its permissions with whatever you specified.
-
-> **State this plainly, because it is easy to miss until it costs someone
-> something: an adopted account becomes fully Vault-managed, exactly as if
-> Vault had created it from scratch.** `vault delete` on that entry deletes
-> the service account in Temporal Cloud — invalidating every API key it
-> owns — the same as for any account Vault created itself. If you adopt a
-> colleague's service account with `force=true`, you have handed Vault the
-> ability to destroy it. `vault read` on the entry shows an `adopted: true`
-> field so this is visible after the fact, but nothing stops the delete from
-> happening.
-
-### `creds/<name>`
-
-Read-only. Mints a fresh API key on the named service account and returns it
-under a Vault lease.
+## Issue credentials
 
 ```bash
 vault read temporalcloud/creds/prod-workers
 ```
 
-```
+```text
 Key                    Value
 ---                    -----
 lease_id               temporalcloud/creds/prod-workers/abc123...
 lease_duration         15m
 lease_renewable        true
-api_key                tcld_...
-api_key_id             apikey-...
+api_key                eyJhbGciOiJFUzI1NiIs...
+api_key_id             A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6
 expires_at             2026-08-07T09:15:00Z
-service_account_id     svcacct-abc123
+service_account_id     <service account id>
 service_account_name   prod-workers
 ```
 
-The token is in the response **once**. Vault does not store it and cannot
-show it to you again — read the path again for a new key. Renewing the lease
-is a Vault-only operation; it never calls Temporal Cloud, because the key was
-minted with an expiry that already outlives any renewal Vault can grant (see
-"How it works" below). Revoking the lease deletes the key in Temporal Cloud.
+The token appears **once**. Vault does not store it and cannot show it again —
+read the path again for a new key.
 
-## The 20-key ceiling
+| Lease event | What happens in Temporal Cloud |
+| --- | --- |
+| Read | A fresh API key is minted, then read back to confirm it exists before the token is returned |
+| Renew | Nothing. Renewal is Vault-side only — the key already outlives any extension Vault can grant |
+| Revoke / expire | The key is deleted, and the deletion is confirmed by reading it back |
 
-> Temporal Cloud allows **20 non-expired API keys per service account**, so at
-> most **20 concurrent leases** can be outstanding per `service-accounts/<name>`
-> entry at any moment. Revoking a lease frees a slot immediately; letting one
-> expire does too. If a workload needs more than 20 concurrent credentials,
-> give it its own service account rather than trying to raise the number —
-> there isn't a knob for that on the Temporal Cloud side.
+Revocation is confirmed rather than assumed: the engine does not treat "the API
+accepted my delete" as proof the credential is gone. A key that survives a
+delete is reported as an error so Vault retries, rather than dropping the lease
+and leaving a live credential nobody is tracking.
 
-The arithmetic that catches people: a `ttl` of 15 minutes and 40 workers each
-holding one lease at a time is fine as long as no more than 20 are alive
-simultaneously — but a `ttl` long enough that leases pile up (say, a `ttl` of
-8 hours with new workers reading a fresh credential every hour) can hit the
-ceiling well before 40 workers exist. The fix is either a shorter `ttl` so old
-leases clear out faster, or a second service account to split the load across.
-
-Reading `creds/<name>` when the ceiling is already hit fails with a message
-naming the count and what to do:
-
-```
-service account "prod-workers" has 20 of 20 permitted API keys in use. Temporal Cloud allows 20
-non-expired keys per service account. Revoke leases, lower ttl (currently 15m0s), or create an
-additional service account.
-```
-
-## Policy guidance
+## Vault policy
 
 ```hcl
 # Platform operators: manage service accounts.
@@ -321,109 +268,177 @@ path "temporalcloud/creds/prod-workers" {
 }
 ```
 
-`service-accounts/*` is a privilege boundary, not just a management path.
-Anyone who can write there can set `account_role=owner` and then read
-`creds/<name>` to mint a key with Account Owner access — full control of the
-Temporal Cloud account. This engine doesn't add a second allowlist on top of
-that; it relies on Vault policy to keep `service-accounts/*` restricted to
-whoever should be trusted with that power, and hands `creds/<name>` reads out
-far more freely, scoped one path per application.
+> **`service-accounts/*` is a privilege boundary, not just a management path.**
+> Anyone who can write there can set `account_role=owner` and then read
+> `creds/<name>` to mint a key with Account Owner access — full control of your
+> Temporal Cloud account.
 
-## Running tests
+The engine deliberately does not add a second allowlist on top of that. It
+relies on Vault policy to keep `service-accounts/*` restricted to whoever
+should be trusted with that power, and expects `creds/<name>` reads to be
+handed out far more freely, scoped one path per application.
 
-- `make test` — the fast suite. No credentials, no network, safe to run
-  anywhere.
-- `make test-live` — the acceptance suite against a real Temporal Cloud
-  account. Needs `TEMPORAL_CLOUD_API_KEY` and `TEMPORAL_CLOUD_ADMIN_SA_ID` set
-  in the environment (a Global-Admin-owned service account key). This mutates
-  real state — it creates and deletes service accounts and API keys — so
-  point it at a Temporal Cloud account you're comfortable with that.
-- `make sweep` — deletes leftover `vault-acctest-*` resources from a live test
-  run that died mid-flight instead of cleaning up after itself.
+`config` and `config/rotate-root` deserve the same treatment as
+`service-accounts/*`: whoever can write `config` chooses which Temporal Cloud
+account the mount points at.
 
-The live suite reads four environment variables:
+## Capacity planning
 
-| Variable | Required | What it does |
-| --- | --- | --- |
-| `TEMPORAL_CLOUD_API_KEY` | Yes | The root credential the tests configure the engine with. |
-| `TEMPORAL_CLOUD_ADMIN_SA_ID` | Yes | The ID of the service account owning that key. |
-| `TEMPORAL_CLOUD_API_KEY_ID` | No | The ID of that key. Without it, `TestLive_RotateRoot` cannot prove the old key was deleted — rotation just warns that it does not know which key to remove, which is the one thing that test exists to check. |
-| `TEMPORAL_CLOUD_ADDRESS` | No | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`; set it for PrivateLink or a non-production endpoint. |
+> Temporal Cloud allows **20 non-expired API keys per service account**, so at
+> most **20 concurrent leases** per `service-accounts/<name>` entry. Revoking a
+> lease frees a slot immediately; letting one expire does too. There is no knob
+> to raise this.
 
-Two live tests are opt-in beyond the two required env vars, because of what
-they do:
+The arithmetic that catches people is about *concurrency*, not headcount. A
+`ttl` of 15 minutes with 40 workers each holding one lease at a time is fine,
+as long as no more than 20 are alive at once. But a `ttl` long enough that
+leases pile up — say 8 hours, with new workers reading a fresh credential every
+hour — can hit the ceiling well before 40 workers exist.
 
-- `TestLive_RotateRoot` **deletes the API key currently configured in your
-  environment** as part of proving rotation end-to-end. It's gated behind
-  `TEMPORAL_CLOUD_ALLOW_ROOT_ROTATION=1` so it never runs by accident.
-- `TestLive_KeyCapacity` mints all 20 keys a service account can hold, to
-  prove the ceiling is enforced and the error message is right. It's gated
-  behind `TEMPORAL_CLOUD_RUN_CAPACITY_TEST=1`.
+Two fixes, in order of preference: shorten `ttl` so old leases clear faster, or
+split the load across additional service accounts. If a workload genuinely
+needs more than 20 concurrent credentials, give it its own service account.
 
-## How it works
+Hitting the ceiling fails the read with a message naming the count:
 
-Reading `creds/<name>`:
-
-```
-vault read creds/prod-workers
-  │
-  ├─ 1. load service-accounts/prod-workers            (missing → error naming the path to create)
-  ├─ 2. count non-expired API keys on that service account; ≥ 20 → fail with the ceiling message
-  ├─ 3. mint an API key on the service account, expiring at max(max_ttl + 10m, 24h + 10m)
-  └─ 4. return the key under a Vault lease with ttl / max_ttl from the entry
-
-renew  → extend the lease, capped at max_ttl. No Temporal Cloud call.
-revoke → delete the API key. A key already gone (NotFound) counts as success.
+```text
+service account "prod-workers" has 20 of 20 permitted API keys in use. Temporal Cloud allows 20
+non-expired keys per service account. Revoke leases, lower ttl (currently 15m0s), or create an
+additional service account.
 ```
 
-**Why the Temporal-side expiry tracks `max_ttl`, not `ttl`.** Setting the
-key's expiry to the lease's current TTL would break renewal: the key would
-die at, say, 1 hour while Vault tried to extend the lease toward an 8-hour
-`max_ttl`, leaving a live lease holding a dead credential. Setting it to
-`max_ttl` plus a 10-minute grace margin means renewal never needs to touch
-Temporal Cloud at all — the key already outlives every extension Vault can
-grant — and a key orphaned by a Vault failure (crash, lost storage, a deleted
-mount) still self-destructs within one maximum lifetime rather than lingering
-forever.
+## Operating the mount
 
-**Why it's `max(max_ttl + 10m, 24h + 10m)`, not just `max_ttl + 10m`.** Live testing
-against the real Cloud Ops API found an undocumented rule: Temporal Cloud
-refuses to mint an API key expiring less than 24 hours from now. A
-`max_ttl` of 30 minutes — a perfectly reasonable lease ceiling — would make
-every mint fail outright with an "invalid argument" error naming that
-24-hour floor. The engine works around it by flooring the Temporal-side
-expiry at 24 hours plus the same 10-minute grace margin when `max_ttl` is
-shorter than that.
+### Storage and seal wrap
 
-This is a real, deliberate trade, and worth being straight about:
+The root credential lives in the mount's `config` entry, which is registered
+for **seal wrapping**. On Vault Enterprise or HSM-backed deployments that means
+it is encrypted with the seal in addition to the barrier.
 
-- **What it does not change:** your Vault lease can still be however short
-  you want — `ttl=5m max_ttl=30m` works fine — and the key is *deleted* the
-  moment the lease it belongs to ends, regardless of its nominal Temporal
-  Cloud expiry. In the normal case (Vault stays up, leases get revoked or
-  expire on schedule), a 30-minute `max_ttl` still means a 30-minute-lived
-  credential.
-- **What it does change:** the fallback. The Temporal-side expiry exists so
-  an *orphaned* key — one Vault never got the chance to revoke, because Vault
-  crashed, lost its storage, or the mount was deleted — eventually
-  self-destructs on its own instead of living forever. That window used to be
-  bounded by `max_ttl`; now it's bounded by at least 24 hours regardless of
-  how short `max_ttl` is. An orphaned key can now outlive its lease ceiling by
-  up to a day. That's a real reduction in defence-in-depth, accepted
-  deliberately because the alternative — refusing to let operators set
-  `max_ttl` below 24 hours — would take away the ability to cap a lease
-  tightly, which undercuts the entire point of a short-lived-credential
-  engine.
+### Replication and HA
 
-## Development
+`config/rotate-root` is marked to forward from performance standbys and
+performance secondaries to the primary. It mutates the stored credential, so it
+must run in exactly one place. Rotation is also serialised within a node: two
+overlapping rotations would each mint a Global Admin key and one would be left
+orphaned outside Vault's config for its full `root_key_ttl`. Avoid scheduling
+rotation from more than one automation.
+
+### Teardown order
+
+Deleting a `service-accounts/<name>` entry deletes the service account in
+Temporal Cloud, which invalidates every API key it owns. **Revoke outstanding
+leases first:**
 
 ```bash
-make build       # compile the plugin, print its SHA256
-make dev         # build + start Vault in -dev mode with it mounted
-make test        # fast tests
-make test-live   # live acceptance tests — see "Running tests" above
-make sweep       # clean up debris from a failed live run
+vault lease revoke -prefix temporalcloud/creds/prod-workers
+vault delete temporalcloud/service-accounts/prod-workers
 ```
+
+Deleting the entry while leases are outstanding leaves those leases pointing at
+keys whose owning service account is gone. Vault still revokes them on
+schedule, and revocation treats an already-absent key as success — but that
+specific path has never been exercised against a live account, so revoking
+first keeps teardown on proven behaviour.
+
+### What to watch
+
+| Signal | Why it matters |
+| --- | --- |
+| Days until `root_key_ttl` elapses | An expired root key stops the mount issuing anything, with no automatic recovery |
+| Credential requests failing with the 20-key message | A service account is at its ceiling; `ttl` is too long or the workload needs its own account |
+| Repeated lease-revocation failures | A key deletion is not taking effect; the credential may still be live in Temporal Cloud |
+| Warnings on `config/rotate-root` | Rotation succeeded but a previous key may need deleting by hand |
+
+`vault read temporalcloud/config` reports `api_key_id`, `address`,
+`root_key_ttl`, and `admin_service_account_id`. It never returns `api_key`.
+
+### Orphaned keys
+
+Every key is minted with a Temporal Cloud-side expiry of
+`max(max_ttl, 24h) + 10m`. That expiry is a **backstop, not the credential's
+lifetime**: in normal operation the key is deleted the moment its lease ends,
+so `max_ttl=30m` really does mean a 30-minute credential.
+
+It matters only when Vault never gets to revoke — a crash, lost storage, a
+deleted mount. Then the key self-destructs on its own at that expiry. The
+24-hour floor exists because Temporal Cloud refuses to mint a key expiring
+sooner than that (undocumented, found by live testing). The practical
+consequence for you: **an orphaned key can outlive its `max_ttl` by up to a
+day.** Short lease ceilings still work; the cleanup-of-last-resort window just
+cannot be shorter than 24 hours.
+
+## Troubleshooting
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `the Temporal Cloud secrets engine is not configured` | No `config` written on this mount | Write `config` |
+| `api_key does not look like a Temporal Cloud API key` | Truncated paste, or not an API key | Re-copy the whole key |
+| `api_key_id is read-only and cannot be set` | Supplied a field Vault derives itself | Remove it from the write |
+| `no service account "…" exists in this Temporal Cloud account` | `admin_service_account_id` is wrong | Check the ID in the Temporal Cloud console |
+| `the supplied api_key was rejected, or its service account lacks permission` | Key expired, revoked, or its account lacks Global Admin | Write `config` with a fresh key |
+| `The configured root API key was rejected…` on a `creds/` read | The mount's own root key has expired or been revoked | Write `config` with a fresh key, then rotate |
+| `no service account named "…" is configured` | Reading `creds/<name>` with no matching entry | Create `service-accounts/<name>` first |
+| `…has 20 of 20 permitted API keys in use` | Ceiling reached | Revoke leases, lower `ttl`, or add a service account |
+| `a service account named "…" already exists in Temporal Cloud` | Name collision | Choose another name, or `force=true` to adopt |
+| `root_key_ttl of … is below Temporal Cloud's minimum` | Below the undocumented 24-hour floor | Raise it to at least 24h |
+| `…did not take effect within 15s` | Temporal Cloud accepted a change but the resource does not reflect it | Retry; if persistent, check Temporal Cloud status |
+| `timed out after 1m0s waiting for operation` | A Cloud Ops operation never reached a terminal state | Retry; check Temporal Cloud status |
+
+## Path reference
+
+### `config`
+
+| Field | Description |
+| --- | --- |
+| `api_key` | **Required.** API key owned by a Global Admin service account. Never returned by a read. |
+| `admin_service_account_id` | **Required.** ID of the service account owning `api_key`. |
+| `address` | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`. Override for PrivateLink or non-production endpoints. |
+| `root_key_ttl` | Expiry for keys minted by `rotate-root`. Default 90 days. Minimum 24 hours, maximum two years; a value outside that is rejected at write time rather than at rotation time. |
+| `api_key_id` | **Read-only.** Returned by a read, rejected on a write. |
+
+Updates merge: `address` and `root_key_ttl` keep their stored values when
+omitted, so swapping the credential does not silently revert a PrivateLink
+address to the public endpoint. `api_key` and `admin_service_account_id` are
+required on every write.
+
+`api_key_id` is read-only because the key already carries it — a Temporal Cloud
+API key is a JWT whose payload names its own ID. The engine reads it from the
+key you write, so it always describes the key actually in use, and rotation can
+always delete the key it replaces. A value you supplied could only ever
+*disagree* with the key it names, and rotation **deletes** whatever that ID
+names, so accepting one would be a way to destroy an unrelated key by typo.
+
+### `config/rotate-root`
+
+Write-only, no fields. Mints a replacement root key, verifies it, stores it,
+deletes the old one.
+
+### `service-accounts/<name>`
+
+| Field | Description |
+| --- | --- |
+| `account_role` | **Required on every write.** One of `owner`, `admin`, `developer`, `finance-admin`, `read`, `metrics-read`. |
+| `namespace_access` | `namespace=permission` pairs (`admin`, `write`, `read`), e.g. `prod.acct1=write,staging.acct1=read`. |
+| `description` | Shown in the Temporal Cloud UI. Defaults to `Managed by Vault mount <mount>`. |
+| `ttl` | Default lease TTL for keys issued here. Default 1 hour. |
+| `max_ttl` | Maximum lease TTL. Also drives the key's Temporal Cloud expiry. Default 24 hours. |
+| `force` | Create only. Adopt an existing Temporal Cloud account of the same name instead of failing. |
+
+Supports `read`, `delete`, and `list`.
+
+### `creds/<name>`
+
+Read-only. Mints a key on the named service account and returns it under a
+lease.
+
+## Try it locally
+
+`examples/demo.sh` walks the full lifecycle against a dev-mode Vault:
+configure, rotate the bootstrap key away, create a service account, mint a
+credential, revoke it, tear down. See
+[`examples/README.md`](examples/README.md) for what to watch in the Temporal
+Cloud UI at each step — it is written for demoing this to someone.
 
 ## License
 

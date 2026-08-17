@@ -63,6 +63,18 @@ func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request,
 		ExpiryTime:       time.Now().Add(cfg.RootKeyTTL),
 	})
 	if err != nil {
+		// As in path_creds.go: a failed wait does not mean nothing was
+		// created. Clean up the replacement we will not be using, so a failed
+		// rotation does not quietly consume one of the admin service
+		// account's twenty key slots each time it is retried.
+		if newKey != nil && newKey.ID != "" {
+			if delErr := c.DeleteAPIKey(ctx, newKey.ID); delErr != nil {
+				b.Logger().Error(
+					"could not delete a replacement root key whose creation did not "+
+						"complete; delete it by hand",
+					"api_key_id", newKey.ID, "error", delErr)
+			}
+		}
 		return respondCloudErr("minting a replacement root API key", err)
 	}
 
@@ -105,9 +117,13 @@ func (b *backend) pathRotateRootWrite(ctx context.Context, req *logical.Request,
 	// 4. Delete the key we replaced, if we know which one it was.
 	if cfg.APIKeyID == "" {
 		resp.AddWarning(
-			"The previous root API key was not deleted because its ID is unknown — " +
-				"api_key_id was not supplied when config was written. Delete it manually " +
-				"in the Temporal Cloud UI. Future rotations will clean up automatically.")
+			"The previous root API key was not deleted because its ID is unknown. " +
+				"Vault normally reads a key's ID out of the key itself, so this means " +
+				"the previous credential was not in the expected format — the config " +
+				"write that stored it would have warned about the same thing. Delete " +
+				"that key manually in the Temporal Cloud UI. The key now in use was " +
+				"minted here, so its ID is known and future rotations will clean up " +
+				"automatically.")
 		return resp, nil
 	}
 

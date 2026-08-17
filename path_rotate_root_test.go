@@ -58,22 +58,30 @@ func TestRotateRoot_ReplacesCredential(t *testing.T) {
 
 // Without a known api_key_id there is nothing to delete. Rotation must still
 // succeed, and must warn so the operator cleans up by hand.
+//
+// The config path no longer produces this state — it rejects any key whose ID
+// it cannot read — so the only way to reach it is stored config written by an
+// earlier build, which is what this seeds directly. The branch stays because
+// bricking rotation on an upgraded mount would be a far worse outcome than
+// warning about one key.
 func TestRotateRoot_WarnsWhenOldKeyIDUnknown(t *testing.T) {
 	b, storage := newTestBackend(t)
 	stub := &stubCloudOps{}
 	withStubClient(b, stub)
 
-	if _, err := b.HandleRequest(context.Background(), &logical.Request{
-		Operation: logical.CreateOperation,
-		Path:      "config",
-		Storage:   storage,
-		Data: map[string]interface{}{
-			"api_key":                  "tmprl_sk_bootstrap",
-			"admin_service_account_id": "sa-123",
-			// api_key_id deliberately omitted
-		},
-	}); err != nil {
-		t.Fatalf("write config: %v", err)
+	legacy := &config{
+		APIKey:                "tmprl_sk_bootstrap_not_a_jwt",
+		AdminServiceAccountID: "sa-123",
+		Address:               defaultAddress,
+		RootKeyTTL:            defaultRootKeyTTL,
+		// APIKeyID deliberately empty, as an older build could leave it.
+	}
+	entry, err := logical.StorageEntryJSON(configStoragePath, legacy)
+	if err != nil {
+		t.Fatalf("seed legacy config: %v", err)
+	}
+	if err := storage.Put(context.Background(), entry); err != nil {
+		t.Fatalf("seed legacy config: %v", err)
 	}
 
 	resp, err := b.HandleRequest(context.Background(), &logical.Request{
@@ -129,7 +137,7 @@ func TestRotateRoot_KeepsOldConfigWhenNewKeyFailsVerification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get config: %v", err)
 	}
-	if cfg.APIKey != "tmprl_sk_test" {
+	if cfg.APIKey != testAPIKey("key-bootstrap") {
 		t.Errorf("expected the original key to survive, got %q", cfg.APIKey)
 	}
 	if cfg.APIKeyID != "key-bootstrap" {
@@ -240,7 +248,7 @@ func TestRotateRoot_UsesRootKeyTTL(t *testing.T) {
 		Path:      "config",
 		Storage:   storage,
 		Data: map[string]interface{}{
-			"api_key":                  "tmprl_sk_test",
+			"api_key":                  testAPIKey("key-bootstrap"),
 			"admin_service_account_id": "sa-123",
 			"root_key_ttl":             "720h", // 30 days
 		},

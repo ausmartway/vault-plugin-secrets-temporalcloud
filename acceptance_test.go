@@ -4,6 +4,7 @@ package temporalcloud
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -47,9 +48,6 @@ func liveBackend(t *testing.T) (*backend, logical.Storage) {
 	data := map[string]interface{}{
 		"api_key":                  apiKey,
 		"admin_service_account_id": adminSAID,
-	}
-	if id := os.Getenv("TEMPORAL_CLOUD_API_KEY_ID"); id != "" {
-		data["api_key_id"] = id
 	}
 	if addr := os.Getenv("TEMPORAL_CLOUD_ADDRESS"); addr != "" {
 		data["address"] = addr
@@ -327,6 +325,12 @@ func TestLive_RotateRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get config: %v", err)
 	}
+	// The ID comes from the token, so it is known even for the hand-issued key
+	// in the environment — which is what makes the deletion assertion below
+	// unconditional rather than dependent on an extra env var.
+	if before.APIKeyID == "" {
+		t.Fatal("expected the configured key's ID to be derived from the key itself")
+	}
 
 	resp, err := b.HandleRequest(context.Background(), &logical.Request{
 		Operation: logical.UpdateOperation,
@@ -348,6 +352,13 @@ func TestLive_RotateRoot(t *testing.T) {
 		t.Fatal("expected the stored root key to change")
 	}
 
+	if after.APIKeyID == before.APIKeyID {
+		t.Fatal("expected the stored key ID to change with the key")
+	}
+	if len(resp.Warnings) != 0 {
+		t.Errorf("expected a clean rotation with the old key deleted, got warnings: %v", resp.Warnings)
+	}
+
 	// The new key must work.
 	c, releaseClient, err := b.getClient(context.Background(), storage)
 	if err != nil {
@@ -356,6 +367,13 @@ func TestLive_RotateRoot(t *testing.T) {
 	t.Cleanup(releaseClient)
 	if _, err := c.GetServiceAccount(context.Background(), after.AdminServiceAccountID); err != nil {
 		t.Fatalf("the rotated root key does not work: %v", err)
+	}
+
+	// And the key it replaced must actually be gone — the point of the whole
+	// path. Deleting an already-absent key reports ErrNotFound, so that is
+	// what proves it went.
+	if err := c.DeleteAPIKey(context.Background(), before.APIKeyID); !errors.Is(err, client.ErrNotFound) {
+		t.Errorf("expected the previous key %s to already be deleted, got %v", before.APIKeyID, err)
 	}
 
 	t.Logf("root rotated: %s -> %s. The key in your environment is now DELETED; "+

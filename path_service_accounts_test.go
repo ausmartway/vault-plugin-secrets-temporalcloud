@@ -3,6 +3,7 @@ package temporalcloud
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -373,6 +374,111 @@ func TestServiceAccounts_CollisionAdoptedWithForce(t *testing.T) {
 	}
 	if !entry.Adopted {
 		t.Error("expected the stored entry to be marked Adopted")
+	}
+}
+
+// Adoption is a property of how the binding came to exist, so it must survive
+// ordinary updates. entry is rebuilt from the request on every write and force
+// is read fresh, so without carrying Adopted forward a later write silently
+// clears it — and Adopted is the only thing telling an operator that Vault
+// manages an account it did not create, and that deleting this entry destroys
+// it anyway.
+func TestServiceAccounts_AdoptedSurvivesUpdate(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	stub := &stubCloudOps{}
+	stub.findServiceAccountByNameFn = func(context.Context, string) (*client.ServiceAccount, error) {
+		return &client.ServiceAccount{ID: "sa-existing"}, nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "developer", "force": true},
+	}); err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+
+	// An ordinary update touching only the role.
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "admin"},
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	entry, err := b.getServiceAccount(context.Background(), storage, "prod-workers")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !entry.Adopted {
+		t.Error("expected Adopted to survive an unrelated update")
+	}
+
+	// And what the operator actually sees, which is the point of the field.
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if resp.Data["adopted"] != true {
+		t.Errorf("expected vault read to still report adopted=true, got %v", resp.Data["adopted"])
+	}
+}
+
+// A create whose Temporal Cloud operation fails can still leave a service
+// account behind: CreateServiceAccount returns the id precisely so the caller
+// can clean it up. A leaked account holds the name, so every retry of this
+// write would then collide with something the operator never asked for.
+func TestServiceAccounts_DeletesAccountWhenCreateFails(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		// The shape CreateServiceAccount returns when the create was accepted
+		// but the wait for the async operation failed.
+		return "sa-halfmade", fmt.Errorf("%w: operation failed", client.ErrInvalidArgument)
+	}
+	var deleted []string
+	stub.deleteServiceAccountFn = func(_ context.Context, id string) error {
+		deleted = append(deleted, id)
+		return nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "developer"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if resp == nil || !resp.IsError() {
+		t.Fatalf("expected an error response, got %v", resp)
+	}
+
+	if len(deleted) != 1 || deleted[0] != "sa-halfmade" {
+		t.Errorf("expected the half-created account to be deleted, got %v", deleted)
+	}
+
+	// And nothing should be stored for a write that failed.
+	entry, err := b.getServiceAccount(context.Background(), storage, "prod-workers")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if entry != nil {
+		t.Error("expected no stored entry after a failed create")
 	}
 }
 

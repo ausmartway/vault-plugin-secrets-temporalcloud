@@ -58,7 +58,21 @@ func awaitOperation(
 				return MapGRPCError(err)
 			}
 
-			done, err := classifyOperationState(resp.GetAsyncOperation())
+			// A nil operation means something different here than it does on
+			// the create response. There it means the server reported no
+			// operation, so there is nothing to wait for. Here we asked about
+			// an id we know exists and were told nothing, and
+			// classifyOperationState reads nil as "done, no error" — which
+			// would report a mutation complete that was never confirmed. For
+			// CreateAPIKey that means handing out a token for a key whose
+			// provisioning is unknown, and storing a Vault lease against it.
+			polled := resp.GetAsyncOperation()
+			if polled == nil {
+				return fmt.Errorf("%w: temporal cloud reported no operation for %s",
+					ErrUnavailable, operationID)
+			}
+
+			done, err := classifyOperationState(polled)
 			if err != nil {
 				return err
 			}
