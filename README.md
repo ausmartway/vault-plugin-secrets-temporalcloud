@@ -8,8 +8,8 @@ This document is for the Vault administrator who installs, configures, and
 operates the mount. For changing the plugin itself, see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Every path below is exercised against a real Temporal Cloud account by a live
-acceptance suite, not only against mocks.
+Every path in this document is exercised against a real Temporal Cloud account
+by a live acceptance suite, not against mocks alone.
 
 ## Why run this
 
@@ -49,8 +49,8 @@ are awkward to change later:
 > mint a replacement for a user identity. Hand this engine a user-owned key and
 > `rotate-root` has nothing it can do.
 >
-> **Treat the key you paste in as disposable.** The first thing you will do
-> after configuring the mount is rotate it away, which deletes it. That is the
+> **Treat the key you paste in as disposable.** The first thing you do after
+> configuring the mount is rotate it away, which deletes it. That is the
 > point: from then on, no working root credential has ever existed outside
 > Vault.
 
@@ -173,11 +173,12 @@ is checked in two stages and fails at whichever comes first:
    `admin_service_account_id` back. That single call proves both that the key
    authenticates and that the ID is real and readable by it.
 
-Only then is anything persisted. A wrong key, an expired key, a key whose
-service account lacks Global Admin, or a mistyped `admin_service_account_id`
-all fail at write time with a message naming which — never silently, and never
-on some later credential request. A rejected update leaves the previous
-configuration exactly as it was, so a bad write cannot break a working mount.
+Only then is anything persisted. Four mistakes fail at write time, each with a
+message naming which one: a wrong key, an expired key, a key whose service
+account lacks Global Admin, and a mistyped `admin_service_account_id`. None of
+them fails silently, and none waits for a later credential request. A rejected
+update leaves the previous configuration exactly as it was, so a bad write
+cannot break a working mount.
 
 ### 2. Rotate it immediately
 
@@ -187,7 +188,7 @@ vault write -f temporalcloud/config/rotate-root
 
 This mints a new key on the admin service account, verifies it works, stores
 it, and **deletes the key you pasted**. Run it as part of setup, not as a
-later chore: until you do, a working root credential exists in your shell
+later chore. Until you do, a working root credential exists in your shell
 history, your terminal scrollback, and wherever you copied it from.
 
 The ordering inside rotation is deliberate and worth knowing when something
@@ -291,7 +292,7 @@ read the path again for a new key.
 | --- | --- |
 | Read | A fresh API key is minted, then read back to confirm it exists before the token is returned |
 | Renew | Nothing. Renewal is Vault-side only — the key already outlives any extension Vault can grant |
-| Revoke / expire | The key is deleted, and the deletion is confirmed by reading it back |
+| Revoke / expire | Vault deletes the key, then confirms the deletion by reading it back |
 
 If you raise `max_ttl` on an entry that has outstanding leases, those leases
 keep the ceiling their own keys were minted under. Temporal Cloud fixes an API
@@ -344,7 +345,7 @@ The arithmetic that catches people is about *concurrency*, not headcount. A
 `ttl` of 15 minutes with 40 workers each holding one lease at a time is fine,
 as long as no more than 20 are alive at once. But a `ttl` long enough that
 leases pile up — say 8 hours, with new workers reading a fresh credential every
-hour — can hit the ceiling well before 40 workers exist.
+hour — can reach the ceiling well before 40 workers exist.
 
 Two fixes, in order of preference: shorten `ttl` so old leases clear faster, or
 split the load across additional service accounts. If a workload genuinely
@@ -358,7 +359,7 @@ non-expired keys per service account. Revoke leases, lower ttl (currently 15m0s)
 additional service account.
 ```
 
-## Operating the mount
+## Mount operations
 
 ### Storage and seal wrap
 
@@ -372,8 +373,8 @@ it is encrypted with the seal in addition to the barrier.
 performance secondaries to the primary. It mutates the stored credential, so it
 must run in exactly one place. Rotation is also serialised within a node: two
 overlapping rotations would each mint a Global Admin key and one would be left
-orphaned outside Vault's config for its full `root_key_ttl`. Avoid scheduling
-rotation from more than one automation.
+orphaned outside Vault's `config` entry for its full `root_key_ttl`. Avoid
+scheduling rotation from more than one automation.
 
 ### Teardown order
 
@@ -398,8 +399,8 @@ first keeps teardown on proven behaviour.
 | --- | --- |
 | Days until `root_key_ttl` elapses | An expired root key stops the mount issuing anything, with no automatic recovery |
 | Credential requests failing with the 20-key message | A service account is at its ceiling; `ttl` is too long or the workload needs its own account |
-| Repeated lease-revocation failures | A key deletion is not taking effect; the credential may still be live in Temporal Cloud |
-| Warnings on `config/rotate-root` | Rotation succeeded but a previous key may need deleting by hand |
+| Repeated lease-revocation failures | A key deletion is not taking effect; the credential might still be live in Temporal Cloud |
+| Warnings on `config/rotate-root` | Rotation succeeded but a previous key might need deleting by hand |
 
 `vault read temporalcloud/config` reports `api_key_id`, `address`,
 `root_key_ttl`, and `admin_service_account_id`. It never returns `api_key`.
@@ -416,7 +417,7 @@ deleted mount. Then the key self-destructs on its own at that expiry. The
 24-hour floor exists because Temporal Cloud refuses to mint a key expiring
 sooner than that (undocumented, found by live testing). The practical
 consequence for you: **an orphaned key can outlive its `max_ttl` by up to a
-day.** Short lease ceilings still work; the cleanup-of-last-resort window just
+day.** Short lease ceilings still work; the cleanup-of-last-resort window
 cannot be shorter than 24 hours.
 
 ## Troubleshooting
@@ -470,7 +471,7 @@ deletes the old one.
 | Field | Description |
 | --- | --- |
 | `account_role` | **Required on every write.** One of `owner`, `admin`, `developer`, `finance-admin`, `read`, `metrics-read`. |
-| `namespace_access` | `namespace=permission` pairs (`admin`, `write`, `read`), e.g. `prod.acct1=write,staging.acct1=read`. |
+| `namespace_access` | `namespace=permission` pairs (`admin`, `write`, `read`), for example `prod.acct1=write,staging.acct1=read`. |
 | `description` | Shown in the Temporal Cloud UI. Defaults to `Managed by Vault mount <mount>`. |
 | `ttl` | Default lease TTL for keys issued here. Default 1 hour. |
 | `max_ttl` | Maximum lease TTL. Also drives the key's Temporal Cloud expiry. Default 24 hours. |
