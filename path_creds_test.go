@@ -476,6 +476,218 @@ func TestRenew_ExtendsWithoutCloudCall(t *testing.T) {
 	}
 }
 
+// TestRenew_ClampsMaxTTLToTheKeysCloudExpiry covers raising max_ttl on an
+// entry that already has a live lease. A minted key's Temporal Cloud expiry is
+// immutable — there is no extend call — so the lease must stay inside the
+// window the key was minted with, not the window the entry now advertises.
+// Without the clamp Vault would keep renewing a lease whose credential had
+// already expired in Temporal Cloud.
+func TestRenew_ClampsMaxTTLToTheKeysCloudExpiry(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	var gotSpec client.APIKeySpec
+	stub := &stubCloudOps{}
+	stub.createServiceAccountFn = func(context.Context, client.ServiceAccountSpec) (string, error) {
+		return "sa-1", nil
+	}
+	stub.createAPIKeyFn = func(_ context.Context, spec client.APIKeySpec) (*client.APIKey, error) {
+		gotSpec = spec
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+		"ttl":          "1h",
+		"max_ttl":      "8h",
+	})
+
+	issueTime := time.Now()
+	minted, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil || minted == nil || minted.IsError() {
+		t.Fatalf("read creds: err=%v resp=%v", err, minted)
+	}
+
+	// The clamp needs the key's own expiry, so the mint must record it on the
+	// lease. Nothing else can recover it: Temporal Cloud's expiry is fixed at
+	// create time and max_ttl is free to move afterward.
+	stamped, ok := minted.Secret.InternalData["api_key_expires_at"].(string)
+	if !ok {
+		t.Fatalf("expected api_key_expires_at in internal data, got %v", minted.Secret.InternalData)
+	}
+	if want := gotSpec.ExpiryTime.Format(time.RFC3339); stamped != want {
+		t.Errorf("expected the stamp to match the minted expiry %s, got %s", want, stamped)
+	}
+
+	// The operator raises max_ttl well past the live key's expiry.
+	if _, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+		Data:      map[string]interface{}{"max_ttl": "720h"},
+	}); err != nil {
+		t.Fatalf("raise max_ttl: %v", err)
+	}
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.RenewOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+		Secret: &logical.Secret{
+			InternalData: minted.Secret.InternalData,
+			LeaseOptions: logical.LeaseOptions{TTL: time.Hour, IssueTime: issueTime},
+		},
+	})
+	if err != nil || resp == nil {
+		t.Fatalf("renew: err=%v resp=%v", err, resp)
+	}
+
+	// Vault caps renewals at IssueTime + Secret.MaxTTL, so the returned
+	// max TTL must leave the grace margin intact ahead of the key's expiry —
+	// here the original 8h, not the entry's new 720h. The stamp carries
+	// second precision, so allow a small delta rather than exactly 8h.
+	if delta := resp.Secret.MaxTTL - 8*time.Hour; delta > time.Minute || delta < -time.Minute {
+		t.Errorf("expected the max TTL clamped to the key's 8h window, got %v", resp.Secret.MaxTTL)
+	}
+	if resp.Secret.TTL != time.Hour {
+		t.Errorf("expected the entry's ttl of 1h, got %v", resp.Secret.TTL)
+	}
+}
+
+// TestRenew_ShortMaxTTLIsNotWidenedByTheFlooredExpiry covers the other
+// direction of the clamp. A max_ttl under the 24-hour floor produces a key
+// whose expiry is far beyond max_ttl, and the key's expiry is a ceiling on the
+// lease, never a target: the lease must stay on the operator's short max_ttl.
+func TestRenew_ShortMaxTTLIsNotWidenedByTheFlooredExpiry(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	withStubClient(b, &stubCloudOps{})
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+		"ttl":          "15m",
+		"max_ttl":      "1h",
+	})
+
+	// What the mint records for a 1h max_ttl: floored to 24h, plus grace.
+	expiresAt := time.Now().Add(client.MinAPIKeyExpiry + apiKeyExpiryGrace)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.RenewOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+		Secret: &logical.Secret{
+			InternalData: map[string]interface{}{
+				"api_key_id":           "key-1",
+				"api_key_expires_at":   expiresAt.Format(time.RFC3339),
+				"service_account_name": "prod-workers",
+				"secret_type":          secretTypeAPIKey,
+			},
+			LeaseOptions: logical.LeaseOptions{TTL: 15 * time.Minute, IssueTime: time.Now()},
+		},
+	})
+	if err != nil || resp == nil {
+		t.Fatalf("renew: err=%v resp=%v", err, resp)
+	}
+	if resp.Secret.MaxTTL != time.Hour {
+		t.Errorf("expected the entry's max_ttl of 1h, got %v", resp.Secret.MaxTTL)
+	}
+}
+
+// TestRenew_RefusedOnceTheKeysWindowIsExhausted covers a lease that has
+// already been renewed past its key's usable window — possible for leases
+// issued before the clamp existed. Renewal must fail rather than hand back a
+// non-positive max TTL, which Vault would read as "no backend limit".
+func TestRenew_RefusedOnceTheKeysWindowIsExhausted(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	withStubClient(b, &stubCloudOps{})
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+		"ttl":          "1h",
+		"max_ttl":      "8h",
+	})
+
+	// Inside the grace margin, so the key is effectively spent.
+	expiresAt := time.Now().Add(5 * time.Minute)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.RenewOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+		Secret: &logical.Secret{
+			InternalData: map[string]interface{}{
+				"api_key_id":           "key-1",
+				"api_key_expires_at":   expiresAt.Format(time.RFC3339),
+				"service_account_name": "prod-workers",
+				"secret_type":          secretTypeAPIKey,
+			},
+			LeaseOptions: logical.LeaseOptions{TTL: time.Hour, IssueTime: time.Now()},
+		},
+	})
+	if err == nil && (resp == nil || !resp.IsError()) {
+		t.Fatalf("expected renewal to be refused, got resp=%v", resp)
+	}
+
+	msg := errorMessage(err, resp)
+	if !strings.Contains(msg, "expiry") {
+		t.Errorf("expected the error to explain the key's expiry, got: %s", msg)
+	}
+}
+
+// TestRenew_LeaseWithoutAnExpiryStampStillRenews covers leases issued before
+// the mint began recording api_key_expires_at. There is nothing to clamp
+// against, so they must keep renewing on the entry's max_ttl rather than
+// becoming unrenewable on upgrade.
+func TestRenew_LeaseWithoutAnExpiryStampStillRenews(t *testing.T) {
+	b, storage := newTestBackend(t)
+
+	withStubClient(b, &stubCloudOps{})
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+		"ttl":          "1h",
+		"max_ttl":      "8h",
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.RenewOperation,
+		Path:      "creds/prod-workers",
+		Storage:   storage,
+		Secret: &logical.Secret{
+			InternalData: map[string]interface{}{
+				"api_key_id":           "key-1",
+				"service_account_name": "prod-workers",
+				"secret_type":          secretTypeAPIKey,
+			},
+			LeaseOptions: logical.LeaseOptions{TTL: time.Hour, IssueTime: time.Now()},
+		},
+	})
+	if err != nil || resp == nil {
+		t.Fatalf("renew: err=%v resp=%v", err, resp)
+	}
+	if resp.Secret.MaxTTL != 8*time.Hour {
+		t.Errorf("expected the entry's max_ttl of 8h, got %v", resp.Secret.MaxTTL)
+	}
+}
+
+// errorMessage reads the message off whichever channel a handler used to
+// report the failure — a Go error or a logical error response.
+func errorMessage(err error, resp *logical.Response) string {
+	if err != nil {
+		return err.Error()
+	}
+	if resp != nil && resp.IsError() {
+		return resp.Error().Error()
+	}
+	return ""
+}
+
 // mustWriteServiceAccount creates a service-accounts/<name> entry.
 func mustWriteServiceAccount(t *testing.T, b *backend, storage logical.Storage, name string, data map[string]interface{}) {
 	t.Helper()

@@ -84,7 +84,9 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 					"here (max_ttl plus a short grace margin). Temporal Cloud will not accept an expiry less " +
 					"than 24 hours out, so a max_ttl below that is floored up to 24 hours for the purpose of " +
 					"the Temporal Cloud expiry only — the key is still deleted when its lease ends, so a " +
-					"short max_ttl still means a short-lived credential in practice.",
+					"short max_ttl still means a short-lived credential in practice. Raising max_ttl does " +
+					"not extend leases that already exist: their keys carry the expiry they were minted " +
+					"with, and Temporal Cloud cannot extend an existing key's expiry.",
 			},
 			"force": {
 				Type: framework.TypeBool,

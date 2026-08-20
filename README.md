@@ -106,6 +106,50 @@ vault plugin reload -plugin=vault-plugin-secrets-temporalcloud
 Stored configuration and service-account definitions survive an upgrade.
 Outstanding leases survive too, and remain revocable.
 
+### Install on a multi-node cluster
+
+Vault keeps the plugin registration in storage, so every node in the cluster
+reads the same entry. Vault does not distribute the binary — that part is local
+disk on each node, and you put it there yourself.
+
+Install on **every node that can become active**, standbys included. A standby
+that holds no binary, or a different one, fails to load the mount at the moment
+it takes over. To install across the cluster, follow these steps:
+
+1. Copy the identical binary into `plugin_directory` on every node, at the same
+   path.
+2. Register the plugin once. The registration is a storage write, and Vault
+   forwards it to the active node:
+
+   ```bash
+   vault plugin register -sha256="$SHA" \
+       secret vault-plugin-secrets-temporalcloud
+   ```
+
+3. Enable the mount once:
+
+   ```bash
+   vault secrets enable -path=temporalcloud vault-plugin-secrets-temporalcloud
+   ```
+
+To upgrade, replace the binary on every node, re-register with the new hash,
+then reload across the cluster:
+
+```bash
+vault plugin reload -plugin=vault-plugin-secrets-temporalcloud -scope=global
+```
+
+`-scope=global` carries the reload to every node. Without it, Vault reloads the
+plugin on the single node that served the request and leaves the rest of the
+cluster running the old binary.
+
+Two mount behaviours are already cluster-aware and need nothing from you.
+`config/rotate-root` forwards from performance standbys and performance
+secondaries to the primary, so rotation runs in one place. A `config` write
+invalidates the cached Temporal Cloud client on every node, so no node keeps
+using a credential that rotation has deleted. For more information, see
+[Replication and HA](#replication-and-ha).
+
 ## Configure
 
 ### 1. Write the root credential
@@ -248,6 +292,13 @@ read the path again for a new key.
 | Read | A fresh API key is minted, then read back to confirm it exists before the token is returned |
 | Renew | Nothing. Renewal is Vault-side only — the key already outlives any extension Vault can grant |
 | Revoke / expire | The key is deleted, and the deletion is confirmed by reading it back |
+
+If you raise `max_ttl` on an entry that has outstanding leases, those leases
+keep the ceiling their own keys were minted under. Temporal Cloud fixes an API
+key's expiry when it creates the key and offers no call to extend it, so a
+lease can never outlive the key behind it. To put a longer ceiling into effect,
+revoke the lease and read `creds/<name>` again for a key minted under the new
+`max_ttl`.
 
 Revocation is confirmed rather than assumed: the engine does not treat "the API
 accepted my delete" as proof the credential is gone. A key that survives a
