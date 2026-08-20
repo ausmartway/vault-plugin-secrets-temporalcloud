@@ -121,8 +121,14 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 		},
 		// Kept by Vault for renewal and revocation. The token is deliberately
 		// absent: revocation needs only the key ID.
+		//
+		// The expiry is recorded because renewal has to respect it and cannot
+		// recompute it: Temporal Cloud fixes a key's expiry at create time and
+		// offers no call to extend it, while max_ttl on the entry can be
+		// changed afterward. See secretAPIKeyRenew.
 		map[string]interface{}{
 			"api_key_id":           key.ID,
+			"api_key_expires_at":   expiry.Format(time.RFC3339),
 			"service_account_name": name,
 		},
 	)
