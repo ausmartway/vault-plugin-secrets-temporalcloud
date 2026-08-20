@@ -65,7 +65,7 @@ reason registration fails.** The published `_SHA256SUMS` file covers the
 hash of the *extracted binary*.
 
 ```bash
-VERSION=0.1.0
+VERSION=0.1.1
 OS=linux ARCH=amd64                       # or darwin / arm64
 
 # 1. verify the download

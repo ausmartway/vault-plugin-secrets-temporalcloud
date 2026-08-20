@@ -87,7 +87,7 @@ binary does not depend on the Vault host's libc.
 ```bash
 make release-check                        # validate .goreleaser.yaml
 make snapshot                             # build locally into dist/, publish nothing
-git tag -a v0.1.0 -m "..." && git push origin v0.1.0
+git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
 GITHUB_TOKEN=$(gh auth token) make release
 ```
 

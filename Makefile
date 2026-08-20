@@ -39,7 +39,7 @@ snapshot:
 	goreleaser release --snapshot --clean
 
 ## release: build and publish a GitHub release for the current tag.
-## Tag first (git tag -a v0.1.0 -m ... && git push origin v0.1.0) — GoReleaser
+## Tag first (git tag -a vX.Y.Z -m ... && git push origin vX.Y.Z) — GoReleaser
 ## refuses to run on an untagged or dirty tree, which is the behaviour you want.
 release:
 	@test -n "$$GITHUB_TOKEN" || \
