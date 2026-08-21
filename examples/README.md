@@ -31,7 +31,7 @@ human-held credential outlives its replacement. If someone asks how it knows,
 decoding the middle segment of any API key on screen answers it in about ten
 seconds.
 
-## Running it
+## Run it
 
 Terminal 1:
 
@@ -40,9 +40,9 @@ make dev
 ```
 
 This builds the plugin, starts Vault in `-dev` mode with it registered and
-mounted at `temporalcloud/`, and prints the export lines below. Dev mode keeps
-everything in memory — nothing here needs a running Vault cluster, unsealing,
-or storage setup.
+mounted at `temporalcloud/`, and prints the export lines that follow. Dev mode
+keeps everything in memory — nothing here needs a running Vault cluster,
+unsealing, or storage setup.
 
 Terminal 2:
 
@@ -60,7 +60,7 @@ export VAULT_TOKEN=root
 | 2. Rotate root | Vault mints a fresh key on the admin service account, verifies it works, stores it, and deletes the one you pasted — whose ID it read out of the key itself | Settings → API Keys — a key named `vault-root-<timestamp>` appears and the key from step 1 is gone. Rotate again and watch the same thing happen to the `vault-root-*` key |
 | 3. Create service account | Vault creates `demo-workers` with `read` account access | Settings → Identities — a new service account named `demo-workers` |
 | 4. Read a credential | Vault mints an API key on `demo-workers` and hands it back once, under a 5-minute lease | Settings → API Keys — a key named `vault-demo-workers-<random>` appears |
-| 5. Show the lease | `vault list` on `sys/leases/lookup` — nothing Temporal Cloud–side, just showing Vault's bookkeeping | — |
+| 5. Show the lease | `vault list` on `sys/leases/lookup` — nothing Temporal Cloud–side, this shows Vault's bookkeeping | — |
 | 6. Revoke | Vault deletes the API key it minted in step 4 | Settings → API Keys — that key is gone |
 | 7. Tear down | Vault deletes the service account in Temporal Cloud, then its own entry | Settings → Identities — `demo-workers` is gone |
 

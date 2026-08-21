@@ -19,7 +19,7 @@ this plugin rather than changing it, [README.md](README.md) is what you want.
 The `client` package exposes `CloudOps`, an interface the Vault paths are
 written against, so every handler can be tested without a network.
 
-## Building
+## Build the plugin
 
 ```bash
 make build       # compile into ./bin, print the SHA256 Vault needs
@@ -51,7 +51,7 @@ that. It reads:
 
 Two live tests are opt-in beyond those, because of what they do:
 
-- `TestLive_RotateRoot` **deletes the API key currently in your environment**
+- `TestLive_RotateRoot` **deletes the API key in your environment**
   as part of proving rotation end to end. Gated behind
   `TEMPORAL_CLOUD_ALLOW_ROOT_ROTATION=1` so it never runs by accident.
 - `TestLive_KeyCapacity` mints all 20 keys a service account can hold, to prove
@@ -78,10 +78,10 @@ Two conventions worth knowing before adding tests:
   ID, so tests exercise the real derivation path instead of routing around it.
   Never commit a real key as a fixture.
 
-## Cutting a release
+## Cut a release
 
-Releases are built by [GoReleaser](https://goreleaser.com) from a git tag, for
-linux and darwin on amd64 and arm64, statically linked (`CGO_ENABLED=0`) so the
+[GoReleaser](https://goreleaser.com) builds releases from a git tag, for linux
+and darwin on amd64 and arm64, statically linked (`CGO_ENABLED=0`) so the
 binary does not depend on the Vault host's libc.
 
 ```bash
