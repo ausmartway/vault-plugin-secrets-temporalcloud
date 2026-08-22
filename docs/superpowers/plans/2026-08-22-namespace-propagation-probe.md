@@ -766,7 +766,7 @@ func TestCreds_WarnsWhenThereIsNothingToProbe(t *testing.T) {
 }
 ```
 
-Add a `mustReadCreds` helper to the same file if one does not already exist:
+`mustReadCreds` does not exist in the repo — add it to the same file:
 
 ```go
 func mustReadCreds(t *testing.T, b *backend, storage logical.Storage, name string) *logical.Response {
@@ -784,7 +784,7 @@ func mustReadCreds(t *testing.T, b *backend, storage logical.Storage, name strin
 }
 ```
 
-Ensure the file imports `sync` and `fmt`.
+`path_creds_test.go` already imports `context`, `fmt`, `strings`, `testing`, `time`, `logical`, and `client`. Add `sync` — it is the only one missing.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1006,15 +1006,17 @@ Ensure `acceptance_test.go` imports `fmt` and `time`.
 
 - [ ] **Step 2: Verify it skips cleanly without the new variable**
 
-Run: `go test . -run TestLive_ProbePropagation -v`
-Expected: SKIP with the message naming all three variables. It must not fail when `TEMPORAL_CLOUD_TEST_NAMESPACE` is unset, matching how `TestLive_RotateRoot` gates itself.
+`acceptance_test.go` carries a `//go:build acceptance` tag, so the tag is required or the file is not compiled at all and `go test` reports "no tests to run" — which looks like a pass but verifies nothing.
+
+Run: `go test -tags acceptance . -run TestLive_ProbePropagation -v`
+Expected: SKIP with the message naming all three variables. It must not fail when `TEMPORAL_CLOUD_TEST_NAMESPACE` is unset, matching how `TestLive_RotateRoot` gates itself. Confirm the output says `--- SKIP`, not `no tests to run`.
 
 - [ ] **Step 3: Run it live**
 
 ```bash
 set -a && source .env && set +a
 TEMPORAL_CLOUD_TEST_NAMESPACE=<your namespace, e.g. prod.acct1> \
-  go test . -run TestLive_ProbePropagation -v
+  go test -tags acceptance . -run TestLive_ProbePropagation -v
 ```
 
 Expected: PASS, with a log line reporting the measured lag.
