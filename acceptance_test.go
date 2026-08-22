@@ -569,3 +569,63 @@ func TestLive_CountDisabledKey(t *testing.T) {
 		t.Errorf("expected the disabled key to still be counted (count=1), got %d", count)
 	}
 }
+
+// A wrong bearer-token metadata key produces exactly the Unauthenticated a
+// namespace that has not received the key produces, so every mock-based test
+// would pass against a probe that can never succeed. This is the only test
+// that distinguishes them, which makes it load-bearing rather than optional.
+//
+// It also measures the real propagation lag, which nothing else does: the
+// 50s ceiling was chosen to be comfortably longer than the lag is believed to
+// be, not measured against it.
+func TestLive_ProbePropagation(t *testing.T) {
+	apiKey := os.Getenv("TEMPORAL_CLOUD_API_KEY")
+	adminSAID := os.Getenv("TEMPORAL_CLOUD_ADMIN_SA_ID")
+	namespace := os.Getenv("TEMPORAL_CLOUD_TEST_NAMESPACE")
+	if apiKey == "" || adminSAID == "" || namespace == "" {
+		t.Skip("set TEMPORAL_CLOUD_API_KEY, TEMPORAL_CLOUD_ADMIN_SA_ID, and " +
+			"TEMPORAL_CLOUD_TEST_NAMESPACE (e.g. prod.acct1) to run this")
+	}
+
+	ctx := context.Background()
+
+	c, err := client.NewGRPC(client.Config{
+		APIKey:   apiKey,
+		HostPort: os.Getenv("TEMPORAL_CLOUD_ADDRESS"),
+	})
+	if err != nil {
+		t.Fatalf("connect to temporal cloud: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	key, err := c.CreateAPIKey(ctx, client.APIKeySpec{
+		ServiceAccountID: adminSAID,
+		DisplayName:      fmt.Sprintf("vault-probe-test-%d", time.Now().UnixNano()),
+		Description:      "Transient key for TestLive_ProbePropagation",
+		ExpiryTime:       time.Now().Add(client.MinAPIKeyExpiry + time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("mint a key to probe with: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.DeleteAPIKey(context.Background(), key.ID); err != nil {
+			t.Errorf("could not delete the probe test key %s; delete it by hand: %v",
+				key.ID, err)
+		}
+	})
+
+	probeCtx, cancel := context.WithTimeout(ctx, client.MaxProbeTimeout)
+	defer cancel()
+
+	start := time.Now()
+	if err := client.ProbeNamespace(probeCtx, key.Token, namespace); err != nil {
+		t.Fatalf("probing %s with a freshly minted key failed after %s: %v\n\n"+
+			"If this says the namespace refused the key, check that it has "+
+			"'Allow API key authentication' enabled, and that the bearer-token "+
+			"metadata this probe sends is what the frontend expects.",
+			namespace, time.Since(start), err)
+	}
+
+	t.Logf("namespace %s accepted a freshly minted key after %s "+
+		"(ceiling is %s)", namespace, time.Since(start), client.MaxProbeTimeout)
+}
