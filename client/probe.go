@@ -118,14 +118,21 @@ func ProbeNamespace(ctx context.Context, token, namespace string) error {
 		lastErr = err
 
 		if code := status.Code(err); !retryableProbeCode(code) {
-			return fmt.Errorf("%w: %s refused the key: %s",
-				ErrPermissionDenied, namespace, status.Convert(err).Message())
+			// Not a propagation symptom — something else is wrong with the
+			// request or the frontend. MapGRPCError sorts the code into the
+			// right category instead of assuming a permission problem: an
+			// Unimplemented from an RPC version mismatch is not the same
+			// failure as a rejected grant, and callers above this package
+			// (backend.go's respondCloudErr) give very different operator
+			// guidance for each.
+			return fmt.Errorf("probing %s: %w", namespace, MapGRPCError(err))
 		}
 
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%w: %s did not accept the new api key in time; "+
-				"the key may not have propagated to its cell yet (last response: %s)",
+				"the key may not have propagated to its cell yet, or the namespace "+
+				"may not have API key authentication enabled (last response: %s)",
 				ErrUnavailable, namespace, status.Convert(lastErr).Message())
 		case <-time.After(probePollInterval):
 		}
