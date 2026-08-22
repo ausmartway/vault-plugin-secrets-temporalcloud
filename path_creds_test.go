@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -700,5 +701,170 @@ func mustWriteServiceAccount(t *testing.T, b *backend, storage logical.Storage, 
 	})
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("write service account %s: err=%v resp=%v", name, err, resp)
+	}
+}
+
+func mustReadCreds(t *testing.T, b *backend, storage logical.Storage, name string) *logical.Response {
+	t.Helper()
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/" + name,
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read creds/%s: err=%v resp=%v", name, err, resp)
+	}
+	return resp
+}
+
+// The flag is off by default, and an existing mount must not start making
+// network calls to namespace frontends because it upgraded.
+func TestCreds_NoProbeWhenFlagOff(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{}
+	stub.createAPIKeyFn = func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+
+	probed := 0
+	b.probeNamespace = func(context.Context, string, string) error {
+		probed++
+		return nil
+	}
+
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role":     "developer",
+		"namespace_access": "prod.acct1=write",
+	})
+
+	resp := mustReadCreds(t, b, storage, "prod-workers")
+
+	if probed != 0 {
+		t.Fatalf("probed %d times with the flag off, want 0", probed)
+	}
+	if len(resp.Warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", resp.Warnings)
+	}
+}
+
+// Every granted namespace is probed, not a representative sample: a key can
+// reach one cell and not another.
+func TestCreds_ProbesEveryGrantedNamespace(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{}
+	stub.createAPIKeyFn = func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+
+	var mu sync.Mutex
+	seen := map[string]string{}
+	b.probeNamespace = func(_ context.Context, token, namespace string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		seen[namespace] = token
+		return nil
+	}
+
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role":       "developer",
+		"namespace_access":   "prod.acct1=write,staging.acct1=read",
+		"verify_propagation": true,
+	})
+
+	resp := mustReadCreds(t, b, storage, "prod-workers")
+
+	if len(seen) != 2 {
+		t.Fatalf("probed %d namespaces, want 2: %v", len(seen), seen)
+	}
+	// The probe must authenticate as the key being handed out, not the root
+	// credential — otherwise it proves nothing about this key.
+	for ns, token := range seen {
+		if token != "tmprl_sk_minted" {
+			t.Errorf("probed %s with token %q, want the minted key", ns, token)
+		}
+	}
+	if len(resp.Warnings) != 0 {
+		t.Fatalf("unexpected warnings when every namespace confirmed: %v", resp.Warnings)
+	}
+}
+
+// A namespace that does not confirm produces a warning naming it — and the
+// credential is still returned, because the probe is advisory.
+func TestCreds_WarnsPerUnconfirmedNamespaceAndStillReturnsKey(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{}
+	stub.createAPIKeyFn = func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+
+	b.probeNamespace = func(_ context.Context, _, namespace string) error {
+		if namespace == "staging.acct1" {
+			return fmt.Errorf("%w: staging.acct1 did not accept the new api key in time",
+				client.ErrUnavailable)
+		}
+		return nil
+	}
+
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role":       "developer",
+		"namespace_access":   "prod.acct1=write,staging.acct1=read",
+		"verify_propagation": true,
+	})
+
+	resp := mustReadCreds(t, b, storage, "prod-workers")
+
+	if got := resp.Data["api_key"]; got != "tmprl_sk_minted" {
+		t.Fatalf("api_key = %v, want the key to be returned despite the probe failure", got)
+	}
+	if len(resp.Warnings) != 1 {
+		t.Fatalf("got %d warnings, want exactly 1: %v", len(resp.Warnings), resp.Warnings)
+	}
+	if !strings.Contains(resp.Warnings[0], "staging.acct1") {
+		t.Errorf("warning does not name the namespace: %q", resp.Warnings[0])
+	}
+	if strings.Contains(resp.Warnings[0], "prod.acct1") {
+		t.Errorf("warning names a namespace that confirmed: %q", resp.Warnings[0])
+	}
+}
+
+// An entry whose reach comes from account_role alone has no namespace to probe.
+// Saying so is more honest than silently reporting success.
+func TestCreds_WarnsWhenThereIsNothingToProbe(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{}
+	stub.createAPIKeyFn = func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+
+	probed := 0
+	b.probeNamespace = func(context.Context, string, string) error {
+		probed++
+		return nil
+	}
+
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "admins", map[string]interface{}{
+		"account_role":       "admin",
+		"verify_propagation": true,
+	})
+
+	resp := mustReadCreds(t, b, storage, "admins")
+
+	if probed != 0 {
+		t.Fatalf("probed %d times with no namespace_access, want 0", probed)
+	}
+	if len(resp.Warnings) != 1 {
+		t.Fatalf("got %d warnings, want exactly 1: %v", len(resp.Warnings), resp.Warnings)
+	}
+	if !strings.Contains(resp.Warnings[0], "namespace_access") {
+		t.Errorf("warning should explain there was nothing to verify: %q", resp.Warnings[0])
 	}
 }

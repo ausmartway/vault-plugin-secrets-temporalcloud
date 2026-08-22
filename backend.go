@@ -45,6 +45,17 @@ type backend struct {
 	// call to client.NewGRPC so tests can substitute a stub without dialling
 	// Temporal Cloud.
 	newClient func(cfg client.Config) (client.CloudOps, error)
+
+	// probeNamespace verifies that a freshly minted API key is accepted by a
+	// namespace's frontend. A field rather than a direct call to
+	// client.ProbeNamespace so tests can substitute one without dialling
+	// Temporal Cloud.
+	//
+	// It is deliberately not a method on CloudOps: that interface wraps the
+	// Cloud Ops API and its client is built from the root credential and
+	// shared across requests, whereas this authenticates as the key being
+	// handed out — a different credential on every request.
+	probeNamespace func(ctx context.Context, token, namespace string) error
 }
 
 // Factory is the entrypoint Vault calls to instantiate this plugin.
@@ -62,6 +73,7 @@ func Backend() *backend {
 	var b backend
 
 	b.newClient = client.NewGRPC
+	b.probeNamespace = client.ProbeNamespace
 
 	b.Backend = &framework.Backend{
 		Help:        strings.TrimSpace(backendHelp),

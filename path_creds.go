@@ -133,6 +133,16 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 		},
 	)
 
+	// Verify after the key exists but before it is handed over: Temporal Cloud
+	// distributes keys asynchronously, and the control-plane read-back inside
+	// CreateAPIKey proves only that the key was recorded, not that any cell
+	// will accept it.
+	if entry.VerifyPropagation {
+		for _, warning := range b.verifyPropagation(ctx, entry, key.Token) {
+			resp.AddWarning(warning)
+		}
+	}
+
 	resp.Secret.TTL = entry.TTL
 	resp.Secret.MaxTTL = entry.MaxTTL
 
