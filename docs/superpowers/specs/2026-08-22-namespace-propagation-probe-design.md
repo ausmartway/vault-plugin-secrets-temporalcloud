@@ -246,19 +246,36 @@ help:
 Three distinct warnings, because a warning that means several different things
 is one operators learn to ignore:
 
-- **did not confirm within Ns** — propagation may still be in flight; retrying
-  the connection is the right response.
-- **refused the key**, naming the gRPC status — the likely cause is a namespace
-  without "Allow API key authentication" enabled, which will never pass. This
-  is a configuration error, not a delay.
+- **did not confirm within Ns** — the budget elapsed while the namespace was
+  still answering a retryable code. Propagation may be in flight, so retrying
+  the connection is the right first response. This warning also carries the
+  permanent-failure hypothesis: see below.
+- **stopped early**, naming the gRPC status — the frontend answered something
+  no amount of waiting clears. State the status and nothing more; the cause is
+  not knowable from here.
 - **skipped** — either the entry has no `namespace_access` to verify, or no
   budget remained.
 
-Two namespace configurations fail permanently rather than transiently, and the
-"refused" wording exists for them: a namespace that only allows mTLS, and a
-namespace running both mTLS and API key auth, which is pre-release and does not
-support authenticating with an API key to a namespace endpoint
+Two namespace configurations reject an API key permanently rather than
+transiently: one that only allows mTLS, and one running both mTLS and API key
+auth, which is pre-release and does not support authenticating with an API key
+to a namespace endpoint
 ([cloud/namespaces](https://docs.temporal.io/cloud/namespaces#access-namespaces)).
+
+**Both surface as the timeout warning, not the stopped-early one.** An earlier
+draft of this section attributed them to a fail-fast path, which contradicted
+the table above it: such a namespace answers `PermissionDenied`, and
+`PermissionDenied` is retryable precisely because it is indistinguishable from
+an unpropagated key. So it is retried until the budget elapses, and lands in
+the timeout branch. The mTLS hypothesis therefore belongs in the timeout
+wording. The stopped-early warning is left for codes like `Unimplemented` and
+`Internal`, where naming the status is the only honest thing to say.
+
+The corollary is that this design cannot distinguish a slow cell from a
+namespace that will never accept an API key — both look like a timeout. Telling
+them apart needs the namespace's authentication setting, which the Cloud Ops
+API does not expose through anything this engine already calls. Naming the
+possibility in the warning is the available remedy.
 
 ### 6. Configuration surface
 
