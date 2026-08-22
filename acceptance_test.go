@@ -596,7 +596,13 @@ func TestLive_ProbePropagation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect to temporal cloud: %v", err)
 	}
-	defer func() { _ = c.Close() }()
+	// Registered as a t.Cleanup, not a plain defer: a function's own defers all
+	// run before the testing package invokes any t.Cleanup, so a plain defer
+	// here would close the connection out from under the key-deletion cleanup
+	// below on every run. Registering the close first means it runs last —
+	// t.Cleanup functions run in last-registered-first order — so the deletion
+	// still has a live connection to use.
+	t.Cleanup(func() { _ = c.Close() })
 
 	key, err := c.CreateAPIKey(ctx, client.APIKeySpec{
 		ServiceAccountID: adminSAID,
@@ -604,15 +610,22 @@ func TestLive_ProbePropagation(t *testing.T) {
 		Description:      "Transient key for TestLive_ProbePropagation",
 		ExpiryTime:       time.Now().Add(client.MinAPIKeyExpiry + time.Hour),
 	})
+	// Arm deletion on the key's presence, not the absence of an error, and do
+	// so before checking err: CreateAPIKey can return a non-nil key alongside a
+	// non-nil error when the mint itself succeeded but confirming it timed
+	// out, and a key Temporal Cloud actually created must still be cleaned up
+	// even though this test is about to fail.
+	if key != nil && key.ID != "" {
+		t.Cleanup(func() {
+			if delErr := c.DeleteAPIKey(context.Background(), key.ID); delErr != nil {
+				t.Errorf("could not delete the probe test key %s; delete it by hand: %v",
+					key.ID, delErr)
+			}
+		})
+	}
 	if err != nil {
 		t.Fatalf("mint a key to probe with: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := c.DeleteAPIKey(context.Background(), key.ID); err != nil {
-			t.Errorf("could not delete the probe test key %s; delete it by hand: %v",
-				key.ID, err)
-		}
-	})
 
 	probeCtx, cancel := context.WithTimeout(ctx, client.MaxProbeTimeout)
 	defer cancel()
