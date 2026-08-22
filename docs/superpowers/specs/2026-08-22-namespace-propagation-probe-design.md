@@ -53,6 +53,15 @@ These were settled during design and are not reopened by the implementation:
    sample. Latency is the slowest cell, not the sum.
 3. **A timeout returns the credential with a warning.** The probe is advisory.
    It never fails a credential request and never deletes a minted key.
+
+   This was revisited after the SDK behaviour above came to light, and kept.
+   The argument against it is real: a caller cannot act on a warning it never
+   sees, so the timeout path buys operator visibility rather than caller
+   recovery. It stands anyway, because the blocking wait is where the value
+   is — a timeout means propagation is slower than any budget that fits under
+   Vault's request timeout, and turning that into a hard failure would convert
+   a slow cell into an outage for the whole entry. Do not "fix" this into a
+   hard failure without measuring the timeout rate first.
 4. **Opt in per entry, defaulting off.** No behaviour change for any existing
    mount until an operator asks for it.
 5. **Approach A: raw `workflowservice` stubs, probing with
@@ -112,9 +121,9 @@ closed before returning.
 Dialling once is load-bearing, not an optimisation. gRPC carries the bearer
 token as per-RPC metadata, so an authentication rejection does not poison the
 connection — the same channel can serve every retry. Re-dialling per attempt
-would mean a fresh TLS handshake every 500ms, roughly twenty per namespace
-across a full budget, for no benefit. The retry loop therefore lives inside
-`ProbeNamespace`, below the dial.
+would mean a fresh TLS handshake on every attempt — around twenty-five per
+namespace across a full budget — for no benefit. The retry loop therefore
+lives inside `ProbeNamespace`, below the dial.
 
 It is deliberately not a method on `CloudOps`. That interface is documented as
 the Cloud Ops API wrapper (`client/client.go:1`), and the client behind it is
@@ -181,7 +190,7 @@ instead:
 budget := min(maxProbeTimeout, timeUntil(ctx.Deadline()) - probeSafetyMargin)
 ```
 
-with `maxProbeTimeout = 10 * time.Second` and `probeSafetyMargin = 5 *
+with `maxProbeTimeout = 50 * time.Second` and `probeSafetyMargin = 5 *
 time.Second`. If the resulting budget is under one second, the probe is skipped
 and warned about rather than attempted — the key is already minted, and a Vault
 request that times out underneath the handler would strand it without a lease.
@@ -191,7 +200,34 @@ practice, but unit tests driving the backend directly do — the budget is
 `maxProbeTimeout`. The subtraction is skipped rather than applied to a zero
 deadline, which would otherwise make every test skip the probe.
 
-Retries within the budget use a 500ms interval, matching `confirmPollInterval`.
+Retries within the budget use `probePollInterval = 2 * time.Second` — its own
+constant, deliberately not reusing `confirmPollInterval`. The control-plane
+read-back polls at 500ms because it expects to succeed almost immediately and
+is racing a 15s ceiling. Cross-cell propagation is a slower phenomenon on a
+much longer budget, so polling it four times a second is pointless chatter
+against a namespace frontend. At 2s, a full budget is roughly twenty-five
+attempts.
+
+#### A 50s ceiling does not fit under Vault's default request timeout
+
+Deliberately so, and the deadline-derived budget is what makes that safe
+rather than reckless. Against Vault's 90s default the arithmetic is:
+
+| Case | Async op | Read-back | Remaining | Probe gets |
+| --- | --- | --- | --- | --- |
+| Typical | ~2s | ~0.5s | ~87s | the full 50s |
+| Worst case | 60s | 15s | 15s | 10s |
+
+So `maxProbeTimeout` is a ceiling the probe reaches when the stages above it
+were fast, not a duration it reserves. It can never push a request past Vault's
+deadline, because it only ever spends what is actually left minus the margin.
+The cost of the worst case is a shorter probe, never a killed request — which
+matters because a request Vault kills after the key is minted leaves that key
+with no lease, alive until its Temporal Cloud expiry of at least 24 hours.
+
+An operator who wants the full 50s available even when the stages above run
+long must raise Vault's `default_request_timeout` to at least 130s
+(60 + 15 + 50 + 5). This belongs in the README next to the egress requirement.
 
 ### 5. Error classification
 
@@ -263,10 +299,14 @@ so every mock-based test would pass against a probe that can never succeed.
 
 Both are answered by running the live test; neither blocks writing the code.
 
-1. **Is a 10s ceiling useful?** Nobody has measured the actual propagation lag
-   on this account. If the observed lag routinely exceeds the budget, the
-   feature degrades to a warning generator and `maxProbeTimeout` — or the
-   `operationTimeout`/`confirmTimeout` split above it — needs revisiting.
+1. **What is the actual propagation lag?** The 50s ceiling is chosen to be
+   comfortably longer than the lag is believed to be, not measured against it.
+   The live test should record how long the probe actually waits. Two outcomes
+   change the design: if it routinely lands in single-digit seconds, the
+   worst-case 10s floor in the table above is adequate and the README needs no
+   `default_request_timeout` advice; if it routinely approaches 50s, then the
+   `operationTimeout`/`confirmTimeout` split above the probe is what needs
+   revisiting, because no probe ceiling fits under a 90s request otherwise.
 2. **Is `DescribeNamespace` authorized for every `account_role` the engine
    permits?** A `metrics-read` service account may not carry namespace read
    permission, in which case its probe would report "refused" permanently. If
