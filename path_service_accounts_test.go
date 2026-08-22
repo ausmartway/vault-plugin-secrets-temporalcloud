@@ -1150,3 +1150,35 @@ func TestServiceAccount_VerifyPropagationSurvivesUnrelatedUpdate(t *testing.T) {
 		t.Fatalf("verify_propagation = %v after an unrelated update, want true", got)
 	}
 }
+
+// An explicit verify_propagation=false is indistinguishable from an omitted
+// field unless GetOk reports presence rather than non-zero-ness. The other
+// two tests cannot catch a regression here: one never sets the field, and the
+// other sets it to a non-zero value. This is the one case where turning the
+// probe back off would silently stop working.
+func TestServiceAccount_VerifyPropagationExplicitFalseDisablesIt(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{})
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role":       "developer",
+		"verify_propagation": true,
+	})
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role":       "developer",
+		"verify_propagation": false,
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read service account: err=%v resp=%v", err, resp)
+	}
+
+	if got := resp.Data["verify_propagation"]; got != false {
+		t.Fatalf("verify_propagation = %v after an explicit false, want false", got)
+	}
+}
