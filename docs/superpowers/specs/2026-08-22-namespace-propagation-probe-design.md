@@ -15,6 +15,21 @@ The engine currently returns the credential the moment the control plane
 acknowledges it, so that rejection window is invisible to Vault and lands on
 the caller.
 
+### What the rejection costs the caller
+
+The window does not heal itself on the worker's side. Temporal SDKs treat
+`Unauthenticated` and `PermissionDenied` as non-retryable — only codes such as
+`Unavailable` are in the retryable set — and they fail eagerly on the initial
+connection rather than backing off and reconnecting. A Java worker handed an
+unpropagated key dies during `WorkerFactory.start()` with `PERMISSION_DENIED:
+Request unauthorized`, and the .NET SDK maintainers state that eager failure on
+first connect is deliberate.
+
+So an unpropagated key is not a worker that stalls briefly and recovers. It is
+a worker that crashes at startup and stays down until something restarts it.
+That is what justifies blocking the credential request while the key
+propagates, rather than documenting the race and leaving callers to absorb it.
+
 ## What exists today, and why it is not enough
 
 `CreateAPIKey` finishes by calling `confirmAPIKeyExists`
@@ -89,8 +104,17 @@ A new file `client/probe.go` exports one stateless function:
 func ProbeNamespace(ctx context.Context, token, namespace string) error
 ```
 
-It dials the namespace endpoint, issues `DescribeNamespace{Namespace:
-namespace}`, and closes the connection before returning.
+It dials the namespace endpoint **once**, then retries `DescribeNamespace{
+Namespace: namespace}` on that single connection until it succeeds, the
+classification below says to stop, or the budget elapses. The connection is
+closed before returning.
+
+Dialling once is load-bearing, not an optimisation. gRPC carries the bearer
+token as per-RPC metadata, so an authentication rejection does not poison the
+connection — the same channel can serve every retry. Re-dialling per attempt
+would mean a fresh TLS handshake every 500ms, roughly twenty per namespace
+across a full budget, for no benefit. The retry loop therefore lives inside
+`ProbeNamespace`, below the dial.
 
 It is deliberately not a method on `CloudOps`. That interface is documented as
 the Cloud Ops API wrapper (`client/client.go:1`), and the client behind it is
