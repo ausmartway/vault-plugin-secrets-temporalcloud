@@ -1096,3 +1096,57 @@ func (s *failingStorage) Put(ctx context.Context, entry *logical.StorageEntry) e
 	}
 	return s.Storage.Put(ctx, entry)
 }
+
+// The flag defaults off so enabling the feature is always a deliberate act:
+// an existing mount upgraded to this version must behave exactly as before.
+func TestServiceAccount_VerifyPropagationDefaultsOff(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{})
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read service account: err=%v resp=%v", err, resp)
+	}
+
+	if got := resp.Data["verify_propagation"]; got != false {
+		t.Fatalf("verify_propagation = %v, want false", got)
+	}
+}
+
+// Same merge rule as ttl, max_ttl, and description: an update that does not
+// mention the field must not silently reset it. Without this, a write that
+// only changes ttl would turn the probe off.
+func TestServiceAccount_VerifyPropagationSurvivesUnrelatedUpdate(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{})
+	mustWriteConfig(t, b, storage)
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role":       "developer",
+		"verify_propagation": true,
+	})
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role": "developer",
+		"ttl":          "30m",
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "service-accounts/prod-workers",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read service account: err=%v resp=%v", err, resp)
+	}
+
+	if got := resp.Data["verify_propagation"]; got != true {
+		t.Fatalf("verify_propagation = %v after an unrelated update, want true", got)
+	}
+}

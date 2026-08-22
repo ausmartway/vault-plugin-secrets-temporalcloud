@@ -48,6 +48,13 @@ type serviceAccountEntry struct {
 	// deciding whether to delete it, knows the Temporal Cloud side predates
 	// Vault managing it.
 	Adopted bool `json:"adopted"`
+
+	// VerifyPropagation makes creds/<name> wait for every namespace in
+	// NamespaceAccess to accept a newly minted key before returning it.
+	// Defaults off: it costs a round trip per namespace and needs egress from
+	// the Vault node to the namespace frontends, which not every deployment
+	// has.
+	VerifyPropagation bool `json:"verify_propagation"`
 }
 
 func serviceAccountStoragePath(name string) string {
@@ -94,6 +101,16 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 					"reset its permissions to this specification instead of failing. Adoption makes the account " +
 					"fully Vault-managed, exactly as if Vault had created it: deleting this entry afterward " +
 					"deletes it in Temporal Cloud too. Ignored when updating an entry Vault already manages.",
+			},
+			"verify_propagation": {
+				Type: framework.TypeBool,
+				Description: "Before returning a credential, verify that every namespace in " +
+					"namespace_access accepts the newly minted key. Temporal Cloud distributes keys " +
+					"asynchronously, so a key the Cloud Ops API reports as created is not yet accepted " +
+					"everywhere; a worker handed one fails at startup rather than retrying. This adds a " +
+					"round trip per namespace and requires egress from the Vault node to " +
+					"<namespace>.tmprl.cloud:7233. On timeout the credential is still returned, with a " +
+					"warning naming the namespace. Defaults to false.",
 			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
@@ -159,6 +176,7 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 	_, ttlSet := d.GetOk("ttl")
 	_, maxTTLSet := d.GetOk("max_ttl")
 	_, descriptionSet := d.GetOk("description")
+	_, verifyPropagationSet := d.GetOk("verify_propagation")
 
 	var namespaceAccess map[string]string
 	var ttl, maxTTL time.Duration
@@ -216,12 +234,21 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 		}
 	}
 
+	// Same merge rule as ttl and description: an update that does not mention
+	// the field leaves it alone, so changing ttl cannot silently disable the
+	// probe.
+	verifyPropagation := d.Get("verify_propagation").(bool)
+	if existing != nil && !verifyPropagationSet {
+		verifyPropagation = existing.VerifyPropagation
+	}
+
 	entry := &serviceAccountEntry{
-		AccountRole:     accountRole,
-		NamespaceAccess: namespaceAccess,
-		Description:     description,
-		TTL:             ttl,
-		MaxTTL:          maxTTL,
+		AccountRole:       accountRole,
+		NamespaceAccess:   namespaceAccess,
+		Description:       description,
+		TTL:               ttl,
+		MaxTTL:            maxTTL,
+		VerifyPropagation: verifyPropagation,
 	}
 
 	spec := client.ServiceAccountSpec{
@@ -385,6 +412,7 @@ func (b *backend) pathServiceAccountRead(ctx context.Context, req *logical.Reque
 			"ttl":                int64(entry.TTL.Seconds()),
 			"max_ttl":            int64(entry.MaxTTL.Seconds()),
 			"adopted":            entry.Adopted,
+			"verify_propagation": entry.VerifyPropagation,
 		},
 	}, nil
 }
