@@ -294,6 +294,52 @@ read the path again for a new key.
 | Renew | Nothing. Renewal is Vault-side only — the key already outlives any extension Vault can grant |
 | Revoke / expire | Vault deletes the key, then confirms the deletion by reading it back |
 
+### Verify key propagation
+
+Temporal Cloud distributes API keys asynchronously. A key that the Cloud Ops
+API reports as created might not yet be accepted by every namespace frontend,
+because the key and its permissions still have to reach the cells.
+
+A worker does not necessarily recover from that delay. Temporal SDKs treat
+`Unauthenticated` and `PermissionDenied` as non-retryable and can fail on the
+first connection instead of reconnecting.
+
+Set `verify_propagation=true` on a service account entry to check the key before
+returning it:
+
+```bash
+vault write temporalcloud/service-accounts/prod-workers \
+    account_role=developer \
+    namespace_access=prod.acct1=write \
+    verify_propagation=true
+```
+
+Each `creds/prod-workers` read then connects to every namespace in
+`namespace_access` as the new key and waits until each namespace accepts it.
+The checks run in parallel.
+
+Before enabling this option, consider these requirements:
+
+- **Allow egress to the namespace frontends.** The Vault node must reach
+  `<namespace>.tmprl.cloud:7233`. This destination differs from the
+  `saas-api.tmprl.cloud:443` endpoint that the engine otherwise uses.
+- **Enable API key authentication on each namespace.** A namespace configured
+  for mTLS only cannot accept the probe and produces a warning on every
+  credential request.
+- **Handle warnings.** A timeout never fails credential issuance. Vault returns
+  the credential with a normal lease and a warning naming each namespace that
+  did not confirm it. The warning means that Vault could not verify propagation,
+  not that the credential is invalid.
+
+An entry that grants access through `account_role` alone has no namespaces to
+check. Credential reads from that entry warn that nothing was verified.
+
+The wait uses the time remaining on the Vault request, up to 50 seconds. Key
+creation can consume most of Vault's default 90-second request timeout, leaving
+a shorter verification window. To make the full window available even after
+the maximum key-creation waits, set Vault's `default_request_timeout` to at
+least 130 seconds.
+
 If you raise `max_ttl` on an entry that has outstanding leases, those leases
 keep the ceiling their own keys were minted under. Temporal Cloud fixes an API
 key's expiry when it creates the key and offers no call to extend it, so a
@@ -475,6 +521,7 @@ deletes the old one.
 | `description` | Shown in the Temporal Cloud UI. Defaults to `Managed by Vault mount <mount>`. |
 | `ttl` | Default lease TTL for keys issued here. Default 1 hour. |
 | `max_ttl` | Maximum lease TTL. Also drives the key's Temporal Cloud expiry. Default 24 hours. |
+| `verify_propagation` | Before returning a credential, wait for every namespace in `namespace_access` to accept the new key. Default `false`. See [Verify key propagation](#verify-key-propagation). |
 | `force` | Create only. Adopt an existing Temporal Cloud account of the same name instead of failing. |
 
 Supports `read`, `delete`, and `list`.

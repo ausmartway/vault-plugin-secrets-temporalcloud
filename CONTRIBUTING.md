@@ -48,8 +48,9 @@ that. It reads:
 | `TEMPORAL_CLOUD_API_KEY` | Yes | The root credential the tests configure the engine with. |
 | `TEMPORAL_CLOUD_ADMIN_SA_ID` | Yes | The ID of the service account owning that key. |
 | `TEMPORAL_CLOUD_ADDRESS` | No | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`. |
+| `TEMPORAL_CLOUD_TEST_NAMESPACE` | No | Namespace ID, such as `prod.acct1`, used by the propagation probe test. The namespace must allow API key authentication. |
 
-Two live tests are opt-in beyond those, because of what they do:
+Three live tests are opt-in beyond the required variables:
 
 - `TestLive_RotateRoot` **deletes the API key in your environment**
   as part of proving rotation end to end. Gated behind
@@ -57,6 +58,9 @@ Two live tests are opt-in beyond those, because of what they do:
 - `TestLive_KeyCapacity` mints all 20 keys a service account can hold, to prove
   the ceiling is enforced and the error message is right. Gated behind
   `TEMPORAL_CLOUD_RUN_CAPACITY_TEST=1`.
+- `TestLive_ProbePropagation` mints a key and waits for the named namespace to
+  accept it. Set `TEMPORAL_CLOUD_TEST_NAMESPACE` to run it. The test deletes
+  the key during cleanup.
 
 If a live run dies mid-flight it leaves real resources behind. `make sweep`
 deletes anything named `vault-acctest-*`.
