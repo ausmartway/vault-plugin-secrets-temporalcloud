@@ -1,8 +1,9 @@
 # Subagent-driven-development scratch workspace (ledgers, briefs, review packages)
 .superpowers/
 
-# Build output
+# Build and benchmark output
 /bin/
+/benchmark-results/
 /vault-plugin-secrets-temporalcloud
 
 # GoReleaser build artifacts
