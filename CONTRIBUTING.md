@@ -71,15 +71,20 @@ Use the standalone benchmark to measure propagation without involving Vault:
 
 ```bash
 export TEMPORAL_CLOUD_API_KEY="..."
-export TEMPORAL_CLOUD_ADMIN_SA_ID="..."
 
 go run ./cmd/propagation-benchmark > propagation.csv
 ```
 
-The default run creates 500 keys sequentially over about 8 hours and probes
-`vault-test.rgumq` every 100 milliseconds. The propagation timer starts as soon
-as the raw `CreateApiKey` request returns, before waiting for the asynchronous
-Cloud Ops operation or a control-plane read-back. This avoids hiding data-plane
+The root key must have permission to manage service accounts and API keys. The
+tool creates a temporary service account with `metrics-read` account access and
+an explicit read grant on `vault-test.rgumq`. It uses that account for the
+entire run and deletes it when the process exits normally or receives an
+interrupt.
+
+The default run creates 500 keys sequentially over about 8 hours and probes the
+namespace every 100 milliseconds. The propagation timer starts as soon as the
+raw `CreateApiKey` request returns, before waiting for the asynchronous Cloud
+Ops operation or a control-plane read-back. This avoids hiding data-plane
 propagation behind control-plane confirmation.
 
 The tool deletes each key before starting the next trial, prints a rolling
@@ -100,8 +105,8 @@ go run ./cmd/propagation-benchmark \
 The benchmark retries cleanup five times and stops if it cannot delete a key.
 This fail-safe prevents a long run from silently filling the service account's
 20-key limit. An uncatchable termination such as `kill -9` can still interrupt
-cleanup, so check the service account for a `propagation-benchmark-*` key before
-restarting an interrupted run.
+cleanup. Temporary service account names start with `vault-acctest-`, so run
+`make sweep` before restarting an interrupted run.
 
 ### Testing conventions
 

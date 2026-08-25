@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"sort"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
@@ -36,14 +37,13 @@ const (
 )
 
 type config struct {
-	namespace      string
-	serviceAccount string
-	trials         int
-	interval       time.Duration
-	reportEvery    int
-	pollInterval   time.Duration
-	trialTimeout   time.Duration
-	rpcTimeout     time.Duration
+	namespace    string
+	trials       int
+	interval     time.Duration
+	reportEvery  int
+	pollInterval time.Duration
+	trialTimeout time.Duration
+	rpcTimeout   time.Duration
 }
 
 type result struct {
@@ -69,7 +69,6 @@ func main() {
 func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.namespace, "namespace", "vault-test.rgumq", "fully qualified Temporal Cloud namespace")
-	flag.StringVar(&cfg.serviceAccount, "service-account-id", os.Getenv("TEMPORAL_CLOUD_ADMIN_SA_ID"), "service account that owns benchmark keys (default TEMPORAL_CLOUD_ADMIN_SA_ID)")
 	flag.IntVar(&cfg.trials, "trials", 500, "number of sequential keys to benchmark")
 	flag.DurationVar(&cfg.interval, "interval", time.Minute, "minimum interval between the start of consecutive trials (zero runs continuously)")
 	flag.IntVar(&cfg.reportEvery, "report-every", 25, "write a rolling summary to stderr every N trials (zero disables)")
@@ -85,15 +84,14 @@ func run(cfg config) error {
 	if apiKey == "" {
 		return errors.New("TEMPORAL_CLOUD_API_KEY is not set")
 	}
-	if cfg.serviceAccount == "" {
-		return errors.New("-service-account-id or TEMPORAL_CLOUD_ADMIN_SA_ID is required")
-	}
 	if cfg.namespace == "" || cfg.trials < 1 || cfg.interval < 0 || cfg.reportEvery < 0 ||
 		cfg.pollInterval <= 0 || cfg.trialTimeout <= 0 || cfg.rpcTimeout <= 0 {
 		return errors.New("namespace must be non-empty, counts and interval must not be negative, and trials and timeout durations must be greater than zero")
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// SIGTERM is the normal way to stop a nohup/background run. Catch it as
+	// well as Ctrl-C so both paths delete the temporary service account.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	cloudConn, err := cloudclient.New(cloudclient.Options{
@@ -116,6 +114,20 @@ func run(cfg config) error {
 		return fmt.Errorf("create cleanup client: %w", err)
 	}
 	defer func() { _ = cleanupClient.Close() }()
+
+	serviceAccountID, err := createBenchmarkServiceAccount(ctx, cleanupClient, cfg.namespace)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "created temporary service account %s for namespace %s\n",
+		serviceAccountID, cfg.namespace)
+	defer func() {
+		if err := deleteServiceAccount(cleanupClient, serviceAccountID); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %v; run make sweep or delete it manually\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "deleted temporary service account %s\n", serviceAccountID)
+		}
+	}()
 
 	conn, err := grpc.NewClient(
 		cfg.namespace+".tmprl.cloud:7233",
@@ -149,7 +161,7 @@ func run(cfg config) error {
 		}
 
 		trialStarted := time.Now()
-		r := runTrial(ctx, cloudConn.CloudService(), cleanupClient, svc, cfg, trial)
+		r := runTrial(ctx, cloudConn.CloudService(), cleanupClient, svc, cfg, serviceAccountID, trial)
 		results = append(results, r)
 		outcome := "accepted"
 		if r.err != nil {
@@ -191,6 +203,7 @@ func runTrial(
 	cleanupClient client.CloudOps,
 	namespaceSvc workflowservicev1.WorkflowServiceClient,
 	cfg config,
+	serviceAccountID string,
 	trial int,
 ) result {
 	started := time.Now()
@@ -203,7 +216,7 @@ func runTrial(
 	// command exists to measure.
 	resp, createErr := cloudSvc.CreateApiKey(trialCtx, &cloudservicev1.CreateApiKeyRequest{
 		Spec: &identityv1.ApiKeySpec{
-			OwnerId:     cfg.serviceAccount,
+			OwnerId:     serviceAccountID,
 			OwnerType:   identityv1.OwnerType_OWNER_TYPE_SERVICE_ACCOUNT,
 			DisplayName: fmt.Sprintf("propagation-benchmark-%d-%d", time.Now().UnixNano(), trial),
 			Description: "Transient key created by propagation-benchmark",
@@ -299,6 +312,32 @@ func waitForReady(ctx context.Context, conn *grpc.ClientConn) error {
 	}
 }
 
+func createBenchmarkServiceAccount(ctx context.Context, cloudOps client.CloudOps, namespace string) (string, error) {
+	name := fmt.Sprintf("vault-acctest-propagation-%d", time.Now().UnixNano())
+	id, err := cloudOps.CreateServiceAccount(ctx, client.ServiceAccountSpec{
+		Name:        name,
+		Description: "Transient service account created by propagation-benchmark",
+		// Keep account-wide access minimal. The explicit namespace grant below
+		// is the permission whose propagation the benchmark needs to observe.
+		AccountRole: "metrics-read",
+		NamespaceAccess: map[string]string{
+			namespace: "read",
+		},
+	})
+	if err == nil {
+		return id, nil
+	}
+
+	// CreateServiceAccount can return an ID when its asynchronous operation or
+	// confirmation fails. Attempt cleanup before surfacing the failure.
+	if id != "" {
+		if cleanupErr := deleteServiceAccount(cloudOps, id); cleanupErr != nil {
+			return "", errors.Join(fmt.Errorf("create temporary service account: %w", err), cleanupErr)
+		}
+	}
+	return "", fmt.Errorf("create temporary service account: %w", err)
+}
+
 func deleteKey(cloudOps client.CloudOps, keyID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
@@ -320,6 +359,31 @@ func deleteKey(cloudOps client.CloudOps, keyID string) error {
 		}
 	}
 	return fmt.Errorf("delete benchmark key %s after %d attempts: %w", keyID, cleanupAttempts, lastErr)
+}
+
+func deleteServiceAccount(cloudOps client.CloudOps, serviceAccountID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+
+	var lastErr error
+	for attempt := 1; attempt <= cleanupAttempts; attempt++ {
+		if err := cloudOps.DeleteServiceAccount(ctx, serviceAccountID); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		timer := time.NewTimer(time.Duration(attempt) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("delete temporary service account %s: %w",
+				serviceAccountID, errors.Join(lastErr, ctx.Err()))
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf("delete temporary service account %s after %d attempts: %w",
+		serviceAccountID, cleanupAttempts, lastErr)
 }
 
 func waitUntil(ctx context.Context, when time.Time) error {
