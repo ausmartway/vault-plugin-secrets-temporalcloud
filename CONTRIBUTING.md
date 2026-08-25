@@ -65,6 +65,44 @@ Three live tests are opt-in beyond the required variables:
 If a live run dies mid-flight it leaves real resources behind. `make sweep`
 deletes anything named `vault-acctest-*`.
 
+### Benchmark API key propagation
+
+Use the standalone benchmark to measure propagation without involving Vault:
+
+```bash
+export TEMPORAL_CLOUD_API_KEY="..."
+export TEMPORAL_CLOUD_ADMIN_SA_ID="..."
+
+go run ./cmd/propagation-benchmark > propagation.csv
+```
+
+The default run creates 500 keys sequentially over about 8 hours and probes
+`vault-test.rgumq` every 100 milliseconds. The propagation timer starts as soon
+as the raw `CreateApiKey` request returns, before waiting for the asynchronous
+Cloud Ops operation or a control-plane read-back. This avoids hiding data-plane
+propagation behind control-plane confirmation.
+
+The tool deletes each key before starting the next trial, prints a rolling
+summary to stderr every 25 trials, and writes each raw sample to standard output
+immediately. Redirect standard output to retain the CSV data.
+
+Use flags to change the schedule or target:
+
+```bash
+go run ./cmd/propagation-benchmark \
+  -namespace vault-test.rgumq \
+  -trials 600 \
+  -interval 1m \
+  -poll-interval 100ms \
+  > propagation.csv
+```
+
+The benchmark retries cleanup five times and stops if it cannot delete a key.
+This fail-safe prevents a long run from silently filling the service account's
+20-key limit. An uncatchable termination such as `kill -9` can still interrupt
+cleanup, so check the service account for a `propagation-benchmark-*` key before
+restarting an interrupted run.
+
 ### Testing conventions
 
 Behaviour that matters is expected to have a test that **fails without the
