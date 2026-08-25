@@ -344,11 +344,15 @@ func deleteKey(cloudOps client.CloudOps, keyID string) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= cleanupAttempts; attempt++ {
-		if err := cloudOps.DeleteAPIKey(ctx, keyID); err == nil {
+		err := cloudOps.DeleteAPIKey(ctx, keyID)
+		if err == nil || errors.Is(err, client.ErrNotFound) {
+			// DeleteAPIKey confirms deletion by reading the key back. A retry can
+			// therefore find that an earlier attempt succeeded even when that
+			// attempt's asynchronous response was lost; absent is the outcome the
+			// cleanup needs, not a reason to stop an overnight run.
 			return nil
-		} else {
-			lastErr = err
 		}
+		lastErr = err
 
 		timer := time.NewTimer(time.Duration(attempt) * time.Second)
 		select {
