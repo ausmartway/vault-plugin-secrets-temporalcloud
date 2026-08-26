@@ -14,8 +14,11 @@ import (
 )
 
 func TestProbePollInterval(t *testing.T) {
-	if probePollInterval != 500*time.Millisecond {
-		t.Fatalf("probePollInterval = %s, want 500ms", probePollInterval)
+	if probePollInterval != 200*time.Millisecond {
+		t.Fatalf("probePollInterval = %s, want 200ms", probePollInterval)
+	}
+	if requiredProbeSuccesses != 5 {
+		t.Fatalf("requiredProbeSuccesses = %d, want 5", requiredProbeSuccesses)
 	}
 }
 
@@ -150,6 +153,8 @@ func TestProbeNamespaceRetryableFailureResetsSuccesses(t *testing.T) {
 	responses := []error{
 		nil,
 		status.Error(codes.PermissionDenied, "not propagated everywhere"),
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,

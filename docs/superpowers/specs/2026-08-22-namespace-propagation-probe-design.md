@@ -11,12 +11,12 @@
 > below is retained as decision history and is superseded on this point.
 >
 > **Consistency and interval amendment:** One successful call did not prove that
-> subsequent connections would work. The implemented probe now requires three
+> subsequent connections would work. The implemented probe now requires five
 > consecutive `DescribeNamespace` successes. Every attempt creates and closes
 > its own gRPC connection, and any failure resets the count. Attempts were
-> initially two seconds apart, then reduced to 500ms so the confirmation run
-> adds one second instead of four after the first success. This supersedes the
-> single-success, dial-once, two-second design retained below as history.
+> initially two seconds apart, then tuned to 200ms; five successes therefore
+> span at least 800ms after the first one. This supersedes the single-success,
+> dial-once, two-second design retained below as history.
 
 ## Problem
 

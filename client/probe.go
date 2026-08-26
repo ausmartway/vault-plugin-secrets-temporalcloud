@@ -32,18 +32,17 @@ const (
 	// Vault's timeout.
 	MaxProbeTimeout = 55 * time.Second
 
-	// probePollInterval is how often the probe re-asks. Three confirmations at
-	// 500ms span at least one second after the first success: long enough to
-	// catch an inconsistent frontend without adding four seconds to every
-	// credential after propagation has already completed. Faster polling would
-	// add fresh TLS handshakes without materially improving that signal.
-	probePollInterval = 500 * time.Millisecond
+	// probePollInterval is how often the probe re-asks. Five confirmations at
+	// 200ms span at least 800ms after the first success: long enough to sample
+	// several independent connections without materially delaying a credential
+	// whose key has already propagated.
+	probePollInterval = 200 * time.Millisecond
 
 	// requiredProbeSuccesses guards against a successful response from one
 	// frontend being mistaken for complete propagation. Each confirmation uses
-	// a fresh connection, so three in a row demonstrate that acceptance is not
+	// a fresh connection, so five in a row demonstrate that acceptance is not
 	// limited to one connection or one backend reached through the endpoint.
-	requiredProbeSuccesses = 3
+	requiredProbeSuccesses = 5
 )
 
 // namespaceEndpoint builds the gRPC address for a namespace.
@@ -89,7 +88,7 @@ type namespaceProbeAttempt func(ctx context.Context, token, namespace string) er
 // ProbeNamespace reports whether a namespace frontend consistently accepts
 // token and honours the grant it carries.
 //
-// It returns nil after three consecutive DescribeNamespace calls succeed, each
+// It returns nil after five consecutive DescribeNamespace calls succeed, each
 // over a fresh gRPC connection. A retryable failure resets the success count;
 // an error is returned if the context ends first or the frontend answers with
 // something no amount of waiting will clear. Callers treat the error as
