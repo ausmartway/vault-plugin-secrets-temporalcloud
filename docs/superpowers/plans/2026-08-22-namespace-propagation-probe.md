@@ -16,6 +16,12 @@
 > `probeBudget` no longer subtracts its own safety margin because that would
 > double-count the delivery headroom. The original steps below remain as
 > implementation history and are superseded on these timeout values.
+>
+> **Implemented consistency amendment:** A later test showed that one success
+> did not guarantee a subsequent connection would work. `ProbeNamespace` now
+> requires three consecutive successes, two seconds apart, and creates a fresh
+> gRPC connection for every attempt. Any failure resets the count. This
+> supersedes the dial-once and single-success steps below.
 
 ## Global Constraints
 

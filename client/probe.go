@@ -39,6 +39,12 @@ const (
 	// and polling a namespace frontend four times a second is pointless
 	// chatter.
 	probePollInterval = 2 * time.Second
+
+	// requiredProbeSuccesses guards against a successful response from one
+	// frontend being mistaken for complete propagation. Each confirmation uses
+	// a fresh connection, so three in a row demonstrate that acceptance is not
+	// limited to one connection or one backend reached through the endpoint.
+	requiredProbeSuccesses = 3
 )
 
 // namespaceEndpoint builds the gRPC address for a namespace.
@@ -73,13 +79,22 @@ func retryableProbeCode(code codes.Code) bool {
 	}
 }
 
-// ProbeNamespace reports whether a namespace frontend accepts token and
-// honours the grant it carries.
+type probeConnection interface {
+	grpc.ClientConnInterface
+	Close() error
+}
+
+type namespaceProbeDialer func(endpoint string) (probeConnection, error)
+type namespaceProbeAttempt func(ctx context.Context, token, namespace string) error
+
+// ProbeNamespace reports whether a namespace frontend consistently accepts
+// token and honours the grant it carries.
 //
-// It returns nil once DescribeNamespace succeeds, and an error if the context
-// ends first or the frontend answers with something no amount of waiting will
-// clear. Callers treat the error as advisory: this never decides whether a
-// credential is issued.
+// It returns nil after three consecutive DescribeNamespace calls succeed, each
+// over a fresh gRPC connection. A retryable failure resets the success count;
+// an error is returned if the context ends first or the frontend answers with
+// something no amount of waiting will clear. Callers treat the error as
+// advisory: this never decides whether a credential is issued.
 //
 // DescribeNamespace is used rather than the cheaper GetSystemInfo because what
 // propagates across cells is not only the key but the key's permission set.
@@ -87,14 +102,69 @@ func retryableProbeCode(code codes.Code) bool {
 // proves it also carries the namespace grant the caller was promised, which is
 // what a worker actually needs.
 func ProbeNamespace(ctx context.Context, token, namespace string) error {
-	// Dial once and retry the RPC on this connection. gRPC carries the bearer
-	// token as per-RPC metadata, so an authentication rejection does not
-	// poison the channel — re-dialling per attempt would mean a fresh TLS
-	// handshake every probePollInterval for no benefit.
-	conn, err := grpc.NewClient(
-		namespaceEndpoint(namespace),
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})),
-	)
+	return probeNamespaceUntilConfirmed(ctx, token, namespace, probePollInterval,
+		func(ctx context.Context, token, namespace string) error {
+			return probeNamespaceOnce(ctx, token, namespace, dialNamespace)
+		})
+}
+
+// probeNamespaceUntilConfirmed requires a run of independent successes rather
+// than trusting the first frontend that accepts the key. The attempt function
+// owns one connection and discards it before returning, so every iteration is
+// independent from gRPC channel state and may reach a different backend.
+func probeNamespaceUntilConfirmed(
+	ctx context.Context,
+	token, namespace string,
+	pollInterval time.Duration,
+	attempt namespaceProbeAttempt,
+) error {
+	consecutiveSuccesses := 0
+	var lastResponse string
+
+	for {
+		err := attempt(ctx, token, namespace)
+		if err == nil {
+			consecutiveSuccesses++
+			lastResponse = fmt.Sprintf("success %d of %d", consecutiveSuccesses, requiredProbeSuccesses)
+			if consecutiveSuccesses == requiredProbeSuccesses {
+				return nil
+			}
+		} else {
+			consecutiveSuccesses = 0
+			lastResponse = status.Convert(err).Message()
+
+			if ctx.Err() == nil {
+				if code := status.Code(err); !retryableProbeCode(code) {
+					// Not a propagation symptom — something else is wrong with the
+					// request or the frontend. MapGRPCError sorts the code into the
+					// right category instead of assuming a permission problem.
+					return fmt.Errorf("probing %s: %w", namespace, MapGRPCError(err))
+				}
+			}
+		}
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%w: %s did not produce %d consecutive confirmations in time; "+
+				"the key may not have propagated to its cell yet, or the namespace "+
+				"may not have API key authentication enabled (last response: %s)",
+				ErrUnavailable, namespace, requiredProbeSuccesses, lastResponse)
+		case <-timer.C:
+		}
+	}
+}
+
+// probeNamespaceOnce owns exactly one connection and makes exactly one RPC.
+// Closing it before returning is load-bearing: the next confirmation must not
+// inherit channel state or backend affinity from this one.
+func probeNamespaceOnce(
+	ctx context.Context,
+	token, namespace string,
+	dial namespaceProbeDialer,
+) error {
+	conn, err := dial(namespaceEndpoint(namespace))
 	if err != nil {
 		return fmt.Errorf("%w: dialling %s: %s", ErrUnavailable, namespace, err)
 	}
@@ -106,35 +176,15 @@ func ProbeNamespace(ctx context.Context, token, namespace string) error {
 
 	svc := workflowservicev1.NewWorkflowServiceClient(conn)
 	authCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+	_, err = svc.DescribeNamespace(authCtx, &workflowservicev1.DescribeNamespaceRequest{
+		Namespace: namespace,
+	})
+	return err
+}
 
-	var lastErr error
-	for {
-		_, err := svc.DescribeNamespace(authCtx, &workflowservicev1.DescribeNamespaceRequest{
-			Namespace: namespace,
-		})
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-
-		if code := status.Code(err); !retryableProbeCode(code) {
-			// Not a propagation symptom — something else is wrong with the
-			// request or the frontend. MapGRPCError sorts the code into the
-			// right category instead of assuming a permission problem: an
-			// Unimplemented from an RPC version mismatch is not the same
-			// failure as a rejected grant, and callers above this package
-			// (backend.go's respondCloudErr) give very different operator
-			// guidance for each.
-			return fmt.Errorf("probing %s: %w", namespace, MapGRPCError(err))
-		}
-
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("%w: %s did not accept the new api key in time; "+
-				"the key may not have propagated to its cell yet, or the namespace "+
-				"may not have API key authentication enabled (last response: %s)",
-				ErrUnavailable, namespace, status.Convert(lastErr).Message())
-		case <-time.After(probePollInterval):
-		}
-	}
+func dialNamespace(endpoint string) (probeConnection, error) {
+	return grpc.NewClient(
+		endpoint,
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})),
+	)
 }

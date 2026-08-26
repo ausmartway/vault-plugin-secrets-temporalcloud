@@ -1,7 +1,7 @@
 # Namespace propagation probe
 
 **Date:** 2026-08-22
-**Status:** Implemented with a timeout amendment
+**Status:** Implemented with post-release amendments
 
 > **Timeout amendment:** External 500-trial benchmarks observed maxima of
 > 43.368s and 46.670s. Credential work is therefore bounded to 55s from handler
@@ -9,6 +9,12 @@
 > probe may use the full remainder of that 55s budget, up to 55s; it does not
 > subtract a second safety margin. The original 50s/90s-server-deadline design
 > below is retained as decision history and is superseded on this point.
+>
+> **Consistency amendment:** One successful call did not prove that subsequent
+> connections would work. The implemented probe now requires three consecutive
+> `DescribeNamespace` successes, two seconds apart. Every attempt creates and
+> closes its own gRPC connection, and any failure resets the count. This
+> supersedes the single-success, dial-once design retained below as history.
 
 ## Problem
 

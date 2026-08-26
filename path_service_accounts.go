@@ -51,9 +51,9 @@ type serviceAccountEntry struct {
 
 	// VerifyPropagation makes creds/<name> wait for every namespace in
 	// NamespaceAccess to accept a newly minted key before returning it.
-	// Defaults off: it costs a round trip per namespace and needs egress from
-	// the Vault node to the namespace frontends, which not every deployment
-	// has.
+	// Defaults off: it costs three connections per namespace at minimum and
+	// needs egress from the Vault node to the namespace frontends, which not
+	// every deployment has.
 	VerifyPropagation bool `json:"verify_propagation"`
 }
 
@@ -107,9 +107,9 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 				Description: "Before returning a credential, verify that every namespace in " +
 					"namespace_access accepts the newly minted key. Temporal Cloud distributes keys " +
 					"asynchronously, so a key the Cloud Ops API reports as created is not yet accepted " +
-					"everywhere; a worker handed one fails at startup rather than retrying. This adds a " +
-					"round trip per namespace and requires egress from the Vault node to " +
-					"<namespace>.tmprl.cloud:7233. On timeout the credential is still returned, with a " +
+					"everywhere; a worker handed one fails at startup rather than retrying. This requires " +
+					"three consecutive checks over fresh connections per namespace and egress from the " +
+					"Vault node to <namespace>.tmprl.cloud:7233. On timeout the credential is still returned, with a " +
 					"warning naming the namespace. Defaults to false.",
 			},
 		},
