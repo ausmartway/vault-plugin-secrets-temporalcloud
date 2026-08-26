@@ -13,6 +13,12 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func TestProbePollInterval(t *testing.T) {
+	if probePollInterval != 500*time.Millisecond {
+		t.Fatalf("probePollInterval = %s, want 500ms", probePollInterval)
+	}
+}
+
 func TestNamespaceEndpoint(t *testing.T) {
 	// The namespace_access map key is already <namespace>.<account>, which is
 	// exactly what the Temporal Cloud namespace endpoint is built from.

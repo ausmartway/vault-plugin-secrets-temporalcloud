@@ -10,11 +10,13 @@
 > subtract a second safety margin. The original 50s/90s-server-deadline design
 > below is retained as decision history and is superseded on this point.
 >
-> **Consistency amendment:** One successful call did not prove that subsequent
-> connections would work. The implemented probe now requires three consecutive
-> `DescribeNamespace` successes, two seconds apart. Every attempt creates and
-> closes its own gRPC connection, and any failure resets the count. This
-> supersedes the single-success, dial-once design retained below as history.
+> **Consistency and interval amendment:** One successful call did not prove that
+> subsequent connections would work. The implemented probe now requires three
+> consecutive `DescribeNamespace` successes. Every attempt creates and closes
+> its own gRPC connection, and any failure resets the count. Attempts were
+> initially two seconds apart, then reduced to 500ms so the confirmation run
+> adds one second instead of four after the first success. This supersedes the
+> single-success, dial-once, two-second design retained below as history.
 
 ## Problem
 

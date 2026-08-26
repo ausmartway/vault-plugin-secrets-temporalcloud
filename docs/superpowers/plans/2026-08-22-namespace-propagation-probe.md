@@ -17,11 +17,13 @@
 > double-count the delivery headroom. The original steps below remain as
 > implementation history and are superseded on these timeout values.
 >
-> **Implemented consistency amendment:** A later test showed that one success
-> did not guarantee a subsequent connection would work. `ProbeNamespace` now
-> requires three consecutive successes, two seconds apart, and creates a fresh
-> gRPC connection for every attempt. Any failure resets the count. This
-> supersedes the dial-once and single-success steps below.
+> **Implemented consistency and interval amendment:** A later test showed that
+> one success did not guarantee a subsequent connection would work.
+> `ProbeNamespace` now requires three consecutive successes and creates a fresh
+> gRPC connection for every attempt. Any failure resets the count. Attempts
+> were initially two seconds apart, then reduced to 500ms so confirmation adds
+> one second instead of four after the first success. This supersedes the
+> dial-once, single-success, and two-second steps below.
 
 ## Global Constraints
 

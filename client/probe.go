@@ -32,13 +32,12 @@ const (
 	// Vault's timeout.
 	MaxProbeTimeout = 55 * time.Second
 
-	// probePollInterval is how often the probe re-asks. It is deliberately
-	// slower than confirmPollInterval: that one polls at 500ms because it
-	// expects to succeed almost immediately against a 15s ceiling, whereas
-	// cross-cell propagation is a slower phenomenon on a much longer budget,
-	// and polling a namespace frontend four times a second is pointless
-	// chatter.
-	probePollInterval = 2 * time.Second
+	// probePollInterval is how often the probe re-asks. Three confirmations at
+	// 500ms span at least one second after the first success: long enough to
+	// catch an inconsistent frontend without adding four seconds to every
+	// credential after propagation has already completed. Faster polling would
+	// add fresh TLS handshakes without materially improving that signal.
+	probePollInterval = 500 * time.Millisecond
 
 	// requiredProbeSuccesses guards against a successful response from one
 	// frontend being mistaken for complete propagation. Each confirmation uses
