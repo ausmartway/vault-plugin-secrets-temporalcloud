@@ -316,7 +316,8 @@ vault write temporalcloud/service-accounts/prod-workers \
 
 Each `creds/prod-workers` read then connects to every namespace in
 `namespace_access` as the new key and waits until each namespace accepts it.
-The checks run in parallel.
+The checks run in parallel. Each check calls `DescribeNamespace` immediately,
+then retries every two seconds on the same gRPC connection.
 
 Before enabling this option, consider these requirements:
 
