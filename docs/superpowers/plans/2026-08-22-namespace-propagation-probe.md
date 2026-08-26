@@ -10,6 +10,13 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-22-namespace-propagation-probe-design.md`
 
+> **Implemented timeout amendment:** Benchmarking after this plan was written
+> raised `client.MaxProbeTimeout` to 55s and added a 55s end-to-end credential
+> work deadline, leaving five seconds below the Vault API client's 60s timeout.
+> `probeBudget` no longer subtracts its own safety margin because that would
+> double-count the delivery headroom. The original steps below remain as
+> implementation history and are superseded on these timeout values.
+
 ## Global Constraints
 
 - **Advisory only.** The probe never returns an error from `pathCredsRead`, never deletes a minted key, and never prevents a lease from being created. Every failure path attaches a warning and continues.

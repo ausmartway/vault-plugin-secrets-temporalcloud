@@ -1,7 +1,14 @@
 # Namespace propagation probe
 
 **Date:** 2026-08-22
-**Status:** Approved, not yet implemented
+**Status:** Implemented with a timeout amendment
+
+> **Timeout amendment:** External 500-trial benchmarks observed maxima of
+> 43.368s and 46.670s. Credential work is therefore bounded to 55s from handler
+> entry, five seconds below the Vault API client's default 60s timeout. The
+> probe may use the full remainder of that 55s budget, up to 55s; it does not
+> subtract a second safety margin. The original 50s/90s-server-deadline design
+> below is retained as decision history and is superseded on this point.
 
 ## Problem
 

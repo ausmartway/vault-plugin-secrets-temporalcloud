@@ -8,11 +8,6 @@ import (
 )
 
 const (
-	// probeSafetyMargin is held back from the request deadline so the probe
-	// finishes and its warnings reach the caller, rather than Vault timing out
-	// the request mid-probe.
-	probeSafetyMargin = 5 * time.Second
-
 	// minUsefulProbeBudget is the point below which probing is not worth
 	// starting: one DescribeNamespace round trip would consume it.
 	minUsefulProbeBudget = time.Second
@@ -30,13 +25,16 @@ const (
 func probeBudget(ctx context.Context) (time.Duration, bool) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		// Vault always sets a deadline; tests driving the backend directly do
-		// not. Subtracting the margin from a zero deadline here would make
-		// every such test skip the probe and pass without exercising it.
+		// Vault always sets a deadline; tests driving this helper directly do
+		// not. Preserve the ceiling in that case so those tests exercise the
+		// probe instead of silently skipping it.
 		return client.MaxProbeTimeout, true
 	}
 
-	budget := time.Until(deadline) - probeSafetyMargin
+	// credentialRequestContext has already placed this deadline five seconds
+	// below the Vault API client's timeout. Subtracting another safety margin
+	// here would double-count that delivery headroom.
+	budget := time.Until(deadline)
 	if budget < minUsefulProbeBudget {
 		return 0, false
 	}

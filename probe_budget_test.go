@@ -36,20 +36,21 @@ func TestProbeBudget(t *testing.T) {
 			wantAtMost:   client.MaxProbeTimeout,
 		},
 		{
-			// Worst case: a 60s async operation plus a 15s read-back leaves
-			// 15s, of which the margin claims 5.
-			name:         "little room yields what is left minus the margin",
+			// Earlier Cloud Ops work consumes the same end-to-end budget. The
+			// probe gets exactly what remains because the enclosing credential
+			// deadline already reserves delivery headroom.
+			name:         "little room yields what is left",
 			deadlineLeft: 15 * time.Second,
 			wantOK:       true,
-			wantAtLeast:  9 * time.Second,
-			wantAtMost:   10 * time.Second,
+			wantAtLeast:  14 * time.Second,
+			wantAtMost:   15 * time.Second,
 		},
 		{
-			// The key is already minted. A request Vault kills underneath us
-			// leaves it with no lease, alive until its Temporal Cloud expiry
-			// of at least 24 hours — so skip rather than gamble.
+			// The key is already minted. Starting a network call with less than
+			// one second left risks reaching the deadline before warnings can be
+			// assembled, so skip rather than gamble.
 			name:         "no room means do not probe",
-			deadlineLeft: 3 * time.Second,
+			deadlineLeft: 500 * time.Millisecond,
 			wantOK:       false,
 		},
 	}

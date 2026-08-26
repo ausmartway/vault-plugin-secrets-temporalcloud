@@ -576,8 +576,9 @@ func TestLive_CountDisabledKey(t *testing.T) {
 // that distinguishes them, which makes it load-bearing rather than optional.
 //
 // It also measures the real propagation lag, which nothing else does: the
-// 50s ceiling was chosen to be comfortably longer than the lag is believed to
-// be, not measured against it.
+// 55s ceiling leaves room for the longest propagation lag observed by the
+// standalone benchmark while keeping credential work below the client's 60s
+// timeout.
 func TestLive_ProbePropagation(t *testing.T) {
 	apiKey := os.Getenv("TEMPORAL_CLOUD_API_KEY")
 	adminSAID := os.Getenv("TEMPORAL_CLOUD_ADMIN_SA_ID")

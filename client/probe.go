@@ -30,7 +30,7 @@ const (
 	// the real budget from the remaining request deadline, so a slow
 	// CreateAPIKey shortens the probe instead of pushing the request past
 	// Vault's timeout.
-	MaxProbeTimeout = 50 * time.Second
+	MaxProbeTimeout = 55 * time.Second
 
 	// probePollInterval is how often the probe re-asks. It is deliberately
 	// slower than confirmPollInterval: that one polls at 500ms because it
