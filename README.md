@@ -320,8 +320,8 @@ The namespace checks run in parallel. A check returns only after the configured
 number of consecutive `DescribeNamespace` calls succeed. Each call uses a fresh
 gRPC connection, so one accepting connection cannot be mistaken for complete
 propagation. Any rejection resets the success count. By default, attempts are
-100 milliseconds apart and five successes are required, so confirmation spans
-at least 400 milliseconds after the first success.
+50 milliseconds apart and eight successes are required, so confirmation spans
+at least 350 milliseconds after the first success.
 
 Tune those defaults for the whole mount through `config/probe`:
 
@@ -533,8 +533,8 @@ names, so accepting one would be a way to destroy an unrelated key by typo.
 
 | Field | Description |
 | --- | --- |
-| `interval` | Delay between attempts. Default `100ms`; minimum `50ms`, maximum `5s`. |
-| `consecutive_successes` | Successful attempts required in a row. Default `5`; minimum `1`, maximum `20`. |
+| `interval` | Delay between attempts. Default `50ms`; minimum `50ms`, maximum `5s`. |
+| `consecutive_successes` | Successful attempts required in a row. Default `8`; minimum `1`, maximum `20`. |
 
 The settings apply to every entry on this mount with `verify_propagation=true`.
 Updates merge. Delete the path to restore both defaults. Every attempt uses a

@@ -13,11 +13,11 @@ func TestProbeConfigDefaultsWithoutStoredEntry(t *testing.T) {
 	b, storage := newTestBackend(t)
 	resp := readProbeConfig(t, b, storage)
 
-	if got := resp.Data["interval"]; got != "100ms" {
-		t.Fatalf("interval = %v, want 100ms", got)
+	if got := resp.Data["interval"]; got != "50ms" {
+		t.Fatalf("interval = %v, want 50ms", got)
 	}
-	if got := resp.Data["consecutive_successes"]; got != 5 {
-		t.Fatalf("consecutive_successes = %v, want 5", got)
+	if got := resp.Data["consecutive_successes"]; got != 8 {
+		t.Fatalf("consecutive_successes = %v, want 8", got)
 	}
 }
 
@@ -57,7 +57,7 @@ func TestProbeConfigDeleteRestoresDefaults(t *testing.T) {
 	}
 
 	got := readProbeConfig(t, b, storage)
-	if got.Data["interval"] != "100ms" || got.Data["consecutive_successes"] != 5 {
+	if got.Data["interval"] != "50ms" || got.Data["consecutive_successes"] != 8 {
 		t.Fatalf("settings after delete = %v, want defaults", got.Data)
 	}
 }
@@ -141,7 +141,7 @@ func TestGetProbeConfigFillsMissingLegacyFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Interval != 300*time.Millisecond || cfg.ConsecutiveSuccesses != 5 {
+	if cfg.Interval != 300*time.Millisecond || cfg.ConsecutiveSuccesses != 8 {
 		t.Fatalf("effective legacy config = %+v", cfg)
 	}
 }

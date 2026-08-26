@@ -21,7 +21,7 @@
 > one success did not guarantee a subsequent connection would work.
 > `ProbeNamespace` now requires five consecutive successes and creates a fresh
 > gRPC connection for every attempt. Any failure resets the count. Attempts
-> were initially two seconds apart, then tuned to defaults of 100ms and five
+> were initially two seconds apart, then tuned to defaults of 50ms and eight
 > successes. Those defaults are mount-configurable through `config/probe` as
 > `interval` and `consecutive_successes`; each request uses one settings
 > snapshot. This supersedes the dial-once, single-success, and fixed-interval

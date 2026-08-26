@@ -15,11 +15,11 @@ import (
 
 func TestDefaultProbeSettings(t *testing.T) {
 	settings := DefaultProbeSettings()
-	if settings.Interval != 100*time.Millisecond {
-		t.Fatalf("Interval = %s, want 100ms", settings.Interval)
+	if settings.Interval != 50*time.Millisecond {
+		t.Fatalf("Interval = %s, want 50ms", settings.Interval)
 	}
-	if settings.ConsecutiveSuccesses != 5 {
-		t.Fatalf("ConsecutiveSuccesses = %d, want 5", settings.ConsecutiveSuccesses)
+	if settings.ConsecutiveSuccesses != 8 {
+		t.Fatalf("ConsecutiveSuccesses = %d, want 8", settings.ConsecutiveSuccesses)
 	}
 }
 
@@ -185,12 +185,8 @@ func TestProbeNamespaceRetryableFailureResetsSuccesses(t *testing.T) {
 	responses := []error{
 		nil,
 		status.Error(codes.PermissionDenied, "not propagated everywhere"),
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
 	}
+	responses = append(responses, make([]error, DefaultProbeSuccesses)...)
 	calls := 0
 
 	err := probeNamespaceUntilConfirmed(

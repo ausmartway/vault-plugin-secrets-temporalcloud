@@ -33,16 +33,16 @@ const (
 	MaxProbeTimeout = 55 * time.Second
 
 	// DefaultProbeInterval is how often the probe re-asks unless the mount
-	// overrides it. Five confirmations at 100ms span at least 400ms after the
+	// overrides it. Eight confirmations at 50ms span at least 350ms after the
 	// first success: long enough to sample several independent connections
 	// without materially delaying a credential whose key has already propagated.
-	DefaultProbeInterval = 100 * time.Millisecond
+	DefaultProbeInterval = 50 * time.Millisecond
 
 	// DefaultProbeSuccesses guards against a successful response from one
 	// frontend being mistaken for complete propagation. Each confirmation uses
-	// a fresh connection, so five in a row demonstrate that acceptance is not
+	// a fresh connection, so eight in a row demonstrate that acceptance is not
 	// limited to one connection or one backend reached through the endpoint.
-	DefaultProbeSuccesses = 5
+	DefaultProbeSuccesses = 8
 )
 
 // namespaceEndpoint builds the gRPC address for a namespace.
