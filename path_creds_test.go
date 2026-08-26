@@ -729,7 +729,7 @@ func TestCreds_NoProbeWhenFlagOff(t *testing.T) {
 	withStubClient(b, stub)
 
 	probed := 0
-	b.probeNamespace = func(context.Context, string, string) error {
+	b.probeNamespace = func(context.Context, string, string, client.ProbeSettings) error {
 		probed++
 		return nil
 	}
@@ -762,7 +762,7 @@ func TestCreds_ProbesEveryGrantedNamespace(t *testing.T) {
 
 	var mu sync.Mutex
 	seen := map[string]string{}
-	b.probeNamespace = func(_ context.Context, token, namespace string) error {
+	b.probeNamespace = func(_ context.Context, token, namespace string, _ client.ProbeSettings) error {
 		mu.Lock()
 		defer mu.Unlock()
 		seen[namespace] = token
@@ -793,6 +793,40 @@ func TestCreds_ProbesEveryGrantedNamespace(t *testing.T) {
 	}
 }
 
+func TestCreds_UsesMountProbeConfig(t *testing.T) {
+	b, storage := newTestBackend(t)
+	stub := &stubCloudOps{}
+	stub.createAPIKeyFn = func(context.Context, client.APIKeySpec) (*client.APIKey, error) {
+		return &client.APIKey{ID: "key-1", Token: "tmprl_sk_minted"}, nil
+	}
+	withStubClient(b, stub)
+
+	var got client.ProbeSettings
+	b.probeNamespace = func(_ context.Context, _, _ string, settings client.ProbeSettings) error {
+		got = settings
+		return nil
+	}
+
+	mustWriteConfig(t, b, storage)
+	writeProbeConfig(t, b, storage, map[string]interface{}{
+		"interval":              "275ms",
+		"consecutive_successes": 9,
+	})
+	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
+		"account_role":       "developer",
+		"namespace_access":   "prod.acct1=write",
+		"verify_propagation": true,
+	})
+
+	resp := mustReadCreds(t, b, storage, "prod-workers")
+	if len(resp.Warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", resp.Warnings)
+	}
+	if got.Interval != 275*time.Millisecond || got.ConsecutiveSuccesses != 9 {
+		t.Fatalf("probe settings = %+v, want interval=275ms consecutive_successes=9", got)
+	}
+}
+
 // A namespace that does not confirm produces a warning naming it — and the
 // credential is still returned, because the probe is advisory.
 func TestCreds_WarnsPerUnconfirmedNamespaceAndStillReturnsKey(t *testing.T) {
@@ -803,7 +837,7 @@ func TestCreds_WarnsPerUnconfirmedNamespaceAndStillReturnsKey(t *testing.T) {
 	}
 	withStubClient(b, stub)
 
-	b.probeNamespace = func(_ context.Context, _, namespace string) error {
+	b.probeNamespace = func(_ context.Context, _, namespace string, _ client.ProbeSettings) error {
 		if namespace == "staging.acct1" {
 			return fmt.Errorf("%w: staging.acct1 did not accept the new api key in time",
 				client.ErrUnavailable)
@@ -845,7 +879,7 @@ func TestCreds_WarnsWhenThereIsNothingToProbe(t *testing.T) {
 	withStubClient(b, stub)
 
 	probed := 0
-	b.probeNamespace = func(context.Context, string, string) error {
+	b.probeNamespace = func(context.Context, string, string, client.ProbeSettings) error {
 		probed++
 		return nil
 	}

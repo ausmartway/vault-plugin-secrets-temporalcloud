@@ -135,6 +135,44 @@ func TestLive_ConfigValidatesCredential(t *testing.T) {
 	}
 }
 
+func TestLive_ProbeConfigLifecycle(t *testing.T) {
+	b, storage := liveBackend(t)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "config/probe",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"interval":              "250ms",
+			"consecutive_successes": 8,
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("write config/probe: err=%v resp=%v", err, resp)
+	}
+
+	resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "config/probe",
+		Storage:   storage,
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("read config/probe: err=%v resp=%v", err, resp)
+	}
+	if resp.Data["interval"] != "250ms" || resp.Data["consecutive_successes"] != 8 {
+		t.Fatalf("config/probe = %v", resp.Data)
+	}
+
+	resp, err = b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.DeleteOperation,
+		Path:      "config/probe",
+		Storage:   storage,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("delete config/probe: err=%v resp=%v", err, resp)
+	}
+}
+
 func TestLive_ConfigRejectsBadServiceAccountID(t *testing.T) {
 	b, _ := liveBackend(t)
 

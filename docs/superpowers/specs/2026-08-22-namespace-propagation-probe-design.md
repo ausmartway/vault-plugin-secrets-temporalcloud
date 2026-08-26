@@ -14,9 +14,11 @@
 > subsequent connections would work. The implemented probe now requires five
 > consecutive `DescribeNamespace` successes. Every attempt creates and closes
 > its own gRPC connection, and any failure resets the count. Attempts were
-> initially two seconds apart, then tuned to 100ms; five successes therefore
-> span at least 400ms after the first one. This supersedes the single-success,
-> dial-once, two-second design retained below as history.
+> initially two seconds apart, then tuned to defaults of 100ms and five
+> successes. Those defaults are mount-configurable through `config/probe` as
+> `interval` and `consecutive_successes`; every request uses one stored settings
+> snapshot. This supersedes the single-success, dial-once, fixed-interval design
+> retained below as history.
 
 ## Problem
 

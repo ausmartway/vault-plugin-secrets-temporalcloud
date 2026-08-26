@@ -55,7 +55,7 @@ type backend struct {
 	// Cloud Ops API and its client is built from the root credential and
 	// shared across requests, whereas this authenticates as the key being
 	// handed out — a different credential on every request.
-	probeNamespace func(ctx context.Context, token, namespace string) error
+	probeNamespace func(ctx context.Context, token, namespace string, settings client.ProbeSettings) error
 }
 
 // Factory is the entrypoint Vault calls to instantiate this plugin.
@@ -73,7 +73,7 @@ func Backend() *backend {
 	var b backend
 
 	b.newClient = client.NewGRPC
-	b.probeNamespace = client.ProbeNamespace
+	b.probeNamespace = client.ProbeNamespaceWithSettings
 
 	b.Backend = &framework.Backend{
 		Help:        strings.TrimSpace(backendHelp),
@@ -84,6 +84,7 @@ func Backend() *backend {
 		},
 		Paths: []*framework.Path{
 			b.pathConfig(),
+			b.pathProbeConfig(),
 			b.pathRotateRoot(),
 			b.pathServiceAccounts(),
 			b.pathServiceAccountsList(),

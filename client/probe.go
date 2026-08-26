@@ -32,17 +32,17 @@ const (
 	// Vault's timeout.
 	MaxProbeTimeout = 55 * time.Second
 
-	// probePollInterval is how often the probe re-asks. Five confirmations at
-	// 100ms span at least 400ms after the first success: long enough to sample
-	// several independent connections without materially delaying a credential
-	// whose key has already propagated.
-	probePollInterval = 100 * time.Millisecond
+	// DefaultProbeInterval is how often the probe re-asks unless the mount
+	// overrides it. Five confirmations at 100ms span at least 400ms after the
+	// first success: long enough to sample several independent connections
+	// without materially delaying a credential whose key has already propagated.
+	DefaultProbeInterval = 100 * time.Millisecond
 
-	// requiredProbeSuccesses guards against a successful response from one
+	// DefaultProbeSuccesses guards against a successful response from one
 	// frontend being mistaken for complete propagation. Each confirmation uses
 	// a fresh connection, so five in a row demonstrate that acceptance is not
 	// limited to one connection or one backend reached through the endpoint.
-	requiredProbeSuccesses = 5
+	DefaultProbeSuccesses = 5
 )
 
 // namespaceEndpoint builds the gRPC address for a namespace.
@@ -85,6 +85,23 @@ type probeConnection interface {
 type namespaceProbeDialer func(endpoint string) (probeConnection, error)
 type namespaceProbeAttempt func(ctx context.Context, token, namespace string) error
 
+// ProbeSettings controls how a namespace is confirmed. Validation above this
+// package enforces operator-facing limits; this type still rejects non-positive
+// values so direct callers cannot panic a timer or succeed without probing.
+type ProbeSettings struct {
+	Interval             time.Duration
+	ConsecutiveSuccesses int
+}
+
+// DefaultProbeSettings returns the behavior used by existing mounts that have
+// no config/probe entry.
+func DefaultProbeSettings() ProbeSettings {
+	return ProbeSettings{
+		Interval:             DefaultProbeInterval,
+		ConsecutiveSuccesses: DefaultProbeSuccesses,
+	}
+}
+
 // ProbeNamespace reports whether a namespace frontend consistently accepts
 // token and honours the grant it carries.
 //
@@ -100,7 +117,26 @@ type namespaceProbeAttempt func(ctx context.Context, token, namespace string) er
 // proves it also carries the namespace grant the caller was promised, which is
 // what a worker actually needs.
 func ProbeNamespace(ctx context.Context, token, namespace string) error {
-	return probeNamespaceUntilConfirmed(ctx, token, namespace, probePollInterval,
+	return ProbeNamespaceWithSettings(ctx, token, namespace, DefaultProbeSettings())
+}
+
+// ProbeNamespaceWithSettings is ProbeNamespace with mount-specific sampling
+// settings. Keeping the settings explicit makes one credential request use a
+// stable snapshot even if an operator updates config/probe while it is running.
+func ProbeNamespaceWithSettings(
+	ctx context.Context,
+	token, namespace string,
+	settings ProbeSettings,
+) error {
+	if settings.Interval <= 0 {
+		return fmt.Errorf("%w: probe interval must be greater than zero", ErrInvalidArgument)
+	}
+	if settings.ConsecutiveSuccesses <= 0 {
+		return fmt.Errorf("%w: consecutive probe successes must be greater than zero", ErrInvalidArgument)
+	}
+
+	return probeNamespaceUntilConfirmed(
+		ctx, token, namespace, settings.Interval, settings.ConsecutiveSuccesses,
 		func(ctx context.Context, token, namespace string) error {
 			return probeNamespaceOnce(ctx, token, namespace, dialNamespace)
 		})
@@ -114,6 +150,7 @@ func probeNamespaceUntilConfirmed(
 	ctx context.Context,
 	token, namespace string,
 	pollInterval time.Duration,
+	requiredSuccesses int,
 	attempt namespaceProbeAttempt,
 ) error {
 	consecutiveSuccesses := 0
@@ -123,8 +160,8 @@ func probeNamespaceUntilConfirmed(
 		err := attempt(ctx, token, namespace)
 		if err == nil {
 			consecutiveSuccesses++
-			lastResponse = fmt.Sprintf("success %d of %d", consecutiveSuccesses, requiredProbeSuccesses)
-			if consecutiveSuccesses == requiredProbeSuccesses {
+			lastResponse = fmt.Sprintf("success %d of %d", consecutiveSuccesses, requiredSuccesses)
+			if consecutiveSuccesses == requiredSuccesses {
 				return nil
 			}
 		} else {
@@ -148,7 +185,7 @@ func probeNamespaceUntilConfirmed(
 			return fmt.Errorf("%w: %s did not produce %d consecutive confirmations in time; "+
 				"the key may not have propagated to its cell yet, or the namespace "+
 				"may not have API key authentication enabled (last response: %s)",
-				ErrUnavailable, namespace, requiredProbeSuccesses, lastResponse)
+				ErrUnavailable, namespace, requiredSuccesses, lastResponse)
 		case <-timer.C:
 		}
 	}

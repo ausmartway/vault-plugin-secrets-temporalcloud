@@ -49,6 +49,19 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 				"'vault write %sservice-accounts/%s ...'", name, req.MountPoint, name), nil
 	}
 
+	// Read probe settings before minting. A storage failure after CreateAPIKey
+	// would leave a live key with no response or lease; taking one immutable
+	// snapshot here also means an overlapping config/probe update cannot change
+	// the rules halfway through this request.
+	probeSettings := client.DefaultProbeSettings()
+	if entry.VerifyPropagation {
+		probeCfg, err := b.getProbeConfig(ctx, req.Storage)
+		if err != nil {
+			return nil, err
+		}
+		probeSettings = probeCfg.clientSettings()
+	}
+
 	c, release, err := b.getClient(ctx, req.Storage)
 	if err != nil {
 		return nil, err
@@ -144,7 +157,7 @@ func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *fr
 	// CreateAPIKey proves only that the key was recorded, not that any cell
 	// will accept it.
 	if entry.VerifyPropagation {
-		for _, warning := range b.verifyPropagation(ctx, entry, key.Token) {
+		for _, warning := range b.verifyPropagation(ctx, entry, key.Token, probeSettings) {
 			resp.AddWarning(warning)
 		}
 	}

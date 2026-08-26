@@ -13,12 +13,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestProbePollInterval(t *testing.T) {
-	if probePollInterval != 100*time.Millisecond {
-		t.Fatalf("probePollInterval = %s, want 100ms", probePollInterval)
+func TestDefaultProbeSettings(t *testing.T) {
+	settings := DefaultProbeSettings()
+	if settings.Interval != 100*time.Millisecond {
+		t.Fatalf("Interval = %s, want 100ms", settings.Interval)
 	}
-	if requiredProbeSuccesses != 5 {
-		t.Fatalf("requiredProbeSuccesses = %d, want 5", requiredProbeSuccesses)
+	if settings.ConsecutiveSuccesses != 5 {
+		t.Fatalf("ConsecutiveSuccesses = %d, want 5", settings.ConsecutiveSuccesses)
 	}
 }
 
@@ -123,6 +124,7 @@ func TestProbeNamespaceRequiresThreeFreshConnections(t *testing.T) {
 		"new-token",
 		"prod.acct1",
 		time.Nanosecond,
+		DefaultProbeSuccesses,
 		func(ctx context.Context, token, namespace string) error {
 			return probeNamespaceOnce(ctx, token, namespace, dial)
 		},
@@ -130,8 +132,8 @@ func TestProbeNamespaceRequiresThreeFreshConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("probeNamespaceUntilConfirmed: %v", err)
 	}
-	if len(connections) != requiredProbeSuccesses {
-		t.Fatalf("dialled %d connections, want %d", len(connections), requiredProbeSuccesses)
+	if len(connections) != DefaultProbeSuccesses {
+		t.Fatalf("dialled %d connections, want %d", len(connections), DefaultProbeSuccesses)
 	}
 	for i, conn := range connections {
 		if !conn.closed {
@@ -145,6 +147,36 @@ func TestProbeNamespaceRequiresThreeFreshConnections(t *testing.T) {
 		}
 		if conn.authorization != "Bearer new-token" {
 			t.Errorf("connection %d authorization = %q", i+1, conn.authorization)
+		}
+	}
+}
+
+func TestProbeNamespaceUntilConfirmedUsesConfiguredSuccessCount(t *testing.T) {
+	calls := 0
+	err := probeNamespaceUntilConfirmed(
+		context.Background(), "new-token", "prod.acct1", time.Nanosecond, 2,
+		func(context.Context, string, string) error {
+			calls++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("probeNamespaceUntilConfirmed: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("made %d attempts, want configured count 2", calls)
+	}
+}
+
+func TestProbeNamespaceWithSettingsRejectsNonPositiveValues(t *testing.T) {
+	tests := []ProbeSettings{
+		{Interval: 0, ConsecutiveSuccesses: 1},
+		{Interval: time.Millisecond, ConsecutiveSuccesses: 0},
+	}
+	for _, settings := range tests {
+		err := ProbeNamespaceWithSettings(context.Background(), "token", "prod.acct1", settings)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("settings %+v returned %v, want ErrInvalidArgument", settings, err)
 		}
 	}
 }
@@ -163,6 +195,7 @@ func TestProbeNamespaceRetryableFailureResetsSuccesses(t *testing.T) {
 
 	err := probeNamespaceUntilConfirmed(
 		context.Background(), "new-token", "prod.acct1", time.Nanosecond,
+		DefaultProbeSuccesses,
 		func(context.Context, string, string) error {
 			err := responses[calls]
 			calls++

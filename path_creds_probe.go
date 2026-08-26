@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+
+	"github.com/ausmartway/vault-plugin-secrets-temporalcloud/client"
 )
 
 // verifyPropagation waits for every namespace the entry grants to accept the
@@ -15,7 +17,12 @@ import (
 // cell into an outage for the whole entry and would have to delete a perfectly
 // good credential to avoid orphaning it. The value of this check is in the
 // waiting, which usually succeeds; the warning is what is left when it does not.
-func (b *backend) verifyPropagation(ctx context.Context, entry *serviceAccountEntry, token string) []string {
+func (b *backend) verifyPropagation(
+	ctx context.Context,
+	entry *serviceAccountEntry,
+	token string,
+	settings client.ProbeSettings,
+) []string {
 	if len(entry.NamespaceAccess) == 0 {
 		// An entry whose reach comes from account_role alone has nothing to
 		// probe. Reporting that is more honest than returning silently, which
@@ -50,7 +57,7 @@ func (b *backend) verifyPropagation(ctx context.Context, entry *serviceAccountEn
 		go func(namespace string) {
 			defer wg.Done()
 
-			if err := b.probeNamespace(ctx, token, namespace); err != nil {
+			if err := b.probeNamespace(ctx, token, namespace, settings); err != nil {
 				mu.Lock()
 				warnings = append(warnings, fmt.Sprintf(
 					"namespace %s did not confirm the new API key: %s. The key was still "+

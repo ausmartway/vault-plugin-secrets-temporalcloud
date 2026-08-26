@@ -9,6 +9,7 @@ this plugin rather than changing it, [README.md](README.md) is what you want.
 | --- | --- |
 | `backend.go` | Backend wiring, path registration, the cached Cloud Ops client |
 | `path_config.go` | Root credential and connection settings |
+| `path_probe_config.go` | Mount-wide namespace probe sampling settings |
 | `path_rotate_root.go` | Root key rotation |
 | `path_service_accounts.go` | Service-account definitions and credential policy |
 | `path_creds.go` | Minting leased API keys |

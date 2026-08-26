@@ -316,12 +316,25 @@ vault write temporalcloud/service-accounts/prod-workers \
 
 Each `creds/prod-workers` read then connects to every namespace in
 `namespace_access` as the new key and waits until each namespace accepts it.
-The namespace checks run in parallel. A check returns only after five
-consecutive `DescribeNamespace` calls succeed. Each call uses a fresh gRPC
-connection, with 100 milliseconds between calls, so one accepting connection
-cannot be mistaken for complete propagation. Any rejection resets the success
-count. Once the first check succeeds, confirmation spans at least another 400
-milliseconds.
+The namespace checks run in parallel. A check returns only after the configured
+number of consecutive `DescribeNamespace` calls succeed. Each call uses a fresh
+gRPC connection, so one accepting connection cannot be mistaken for complete
+propagation. Any rejection resets the success count. By default, attempts are
+100 milliseconds apart and five successes are required, so confirmation spans
+at least 400 milliseconds after the first success.
+
+Tune those defaults for the whole mount through `config/probe`:
+
+```bash
+vault write temporalcloud/config/probe \
+    interval=250ms \
+    consecutive_successes=8
+```
+
+Updates merge, so omit a field to retain its current value. Delete
+`config/probe` to restore the defaults. `interval` accepts 50ms through 5s, and
+`consecutive_successes` accepts 1 through 20. Vault rejects a combination whose
+minimum confirmation window would consume the 55-second probe budget.
 
 Before enabling this option, consider these requirements:
 
@@ -361,9 +374,12 @@ and leaving a live credential nobody is tracking.
 ## Vault policy
 
 ```hcl
-# Platform operators: manage service accounts.
+# Platform operators: manage service accounts and probe behavior.
 path "temporalcloud/service-accounts/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "temporalcloud/config/probe" {
+  capabilities = ["create", "read", "update", "delete"]
 }
 
 # Applications: read their own credentials, nothing else.
@@ -512,6 +528,19 @@ key you write, so it always describes the key actually in use, and rotation can
 always delete the key it replaces. A value you supplied could only ever
 *disagree* with the key it names, and rotation **deletes** whatever that ID
 names, so accepting one would be a way to destroy an unrelated key by typo.
+
+### `config/probe`
+
+| Field | Description |
+| --- | --- |
+| `interval` | Delay between attempts. Default `100ms`; minimum `50ms`, maximum `5s`. |
+| `consecutive_successes` | Successful attempts required in a row. Default `5`; minimum `1`, maximum `20`. |
+
+The settings apply to every entry on this mount with `verify_propagation=true`.
+Updates merge. Delete the path to restore both defaults. Every attempt uses a
+fresh gRPC connection, and a failed attempt resets the consecutive-success
+count. The minimum window, `(consecutive_successes - 1) × interval`, must remain
+below the 55-second probe budget.
 
 ### `config/rotate-root`
 
