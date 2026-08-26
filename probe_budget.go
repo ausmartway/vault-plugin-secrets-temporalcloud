@@ -21,14 +21,12 @@ const (
 // probeBudget reports how long the namespace probes may run, and whether
 // running them at all is worthwhile.
 //
-// The budget is derived from the live deadline rather than fixed, because by
-// this point the request has already spent up to operationTimeout awaiting the
-// async operation and up to confirmTimeout on the read-back — 75s of Vault's
-// 90s default between them. A fixed reservation would spend headroom those
-// stages may already have consumed, and a request Vault kills after the key is
-// minted leaves that key with no lease, alive until its Temporal Cloud expiry
-// of at least 24 hours. Deriving it means MaxProbeTimeout is a ceiling reached
-// when the stages above ran fast, never a duration claimed up front.
+// The budget is derived from the live deadline rather than fixed because the
+// Cloud Ops calls above it have already consumed part of the end-to-end
+// credential request budget. A fixed reservation could push the response past
+// the Vault API client's timeout after the key has already been minted, leaving
+// a live key with no lease. Deriving it makes MaxProbeTimeout a ceiling reached
+// only when enough time actually remains, never a duration claimed up front.
 func probeBudget(ctx context.Context) (time.Duration, bool) {
 	deadline, ok := ctx.Deadline()
 	if !ok {

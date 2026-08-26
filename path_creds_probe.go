@@ -30,9 +30,9 @@ func (b *backend) verifyPropagation(ctx context.Context, entry *serviceAccountEn
 	budget, ok := probeBudget(ctx)
 	if !ok {
 		return []string{
-			"verify_propagation is enabled but too little of the request deadline remained " +
-				"to check anything, so the key was returned unverified. Raise Vault's " +
-				"default_request_timeout if this recurs.",
+			"verify_propagation is enabled but too little of the credential request budget " +
+				"remained to check anything, so the key was returned unverified. Earlier " +
+				"Cloud Ops calls consumed the available time; retry with a new credential.",
 		}
 	}
 

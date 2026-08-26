@@ -31,6 +31,12 @@ func (b *backend) pathCreds() *framework.Path {
 }
 
 func (b *backend) pathCredsRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	// Vault's API client defaults to a 60-second HTTP timeout. Bound the whole
+	// issuance path—not only the advisory probe—so a slow Cloud Ops operation
+	// cannot consume the client's deadline before Vault returns an error.
+	ctx, cancel := credentialRequestContext(ctx)
+	defer cancel()
+
 	name := d.Get("name").(string)
 
 	entry, err := b.getServiceAccount(ctx, req.Storage, name)

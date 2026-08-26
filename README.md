@@ -334,11 +334,11 @@ Before enabling this option, consider these requirements:
 An entry that grants access through `account_role` alone has no namespaces to
 check. Credential reads from that entry warn that nothing was verified.
 
-The wait uses the time remaining on the Vault request, up to 50 seconds. Key
-creation can consume most of Vault's default 90-second request timeout, leaving
-a shorter verification window. To make the full window available even after
-the maximum key-creation waits, set Vault's `default_request_timeout` to at
-least 130 seconds.
+The entire `creds/<name>` request is bounded to 55 seconds so Vault can return a
+response before its API client's default 60-second HTTP timeout. The probe uses
+whatever remains after key creation, less five seconds of delivery headroom,
+and never waits longer than 50 seconds. If too little time remains, Vault
+returns the credential with a warning instead of risking a client-side timeout.
 
 If you raise `max_ttl` on an entry that has outstanding leases, those leases
 keep the ceiling their own keys were minted under. Temporal Cloud fixes an API
