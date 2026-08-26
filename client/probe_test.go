@@ -14,8 +14,8 @@ import (
 )
 
 func TestProbePollInterval(t *testing.T) {
-	if probePollInterval != 200*time.Millisecond {
-		t.Fatalf("probePollInterval = %s, want 200ms", probePollInterval)
+	if probePollInterval != 100*time.Millisecond {
+		t.Fatalf("probePollInterval = %s, want 100ms", probePollInterval)
 	}
 	if requiredProbeSuccesses != 5 {
 		t.Fatalf("requiredProbeSuccesses = %d, want 5", requiredProbeSuccesses)

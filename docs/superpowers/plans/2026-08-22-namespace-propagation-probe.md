@@ -21,8 +21,8 @@
 > one success did not guarantee a subsequent connection would work.
 > `ProbeNamespace` now requires five consecutive successes and creates a fresh
 > gRPC connection for every attempt. Any failure resets the count. Attempts
-> were initially two seconds apart, then tuned to 200ms; five successes span at
-> least 800ms after the first one. This supersedes the dial-once,
+> were initially two seconds apart, then tuned to 100ms; five successes span at
+> least 400ms after the first one. This supersedes the dial-once,
 > single-success, and two-second steps below.
 
 ## Global Constraints

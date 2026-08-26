@@ -14,8 +14,8 @@
 > subsequent connections would work. The implemented probe now requires five
 > consecutive `DescribeNamespace` successes. Every attempt creates and closes
 > its own gRPC connection, and any failure resets the count. Attempts were
-> initially two seconds apart, then tuned to 200ms; five successes therefore
-> span at least 800ms after the first one. This supersedes the single-success,
+> initially two seconds apart, then tuned to 100ms; five successes therefore
+> span at least 400ms after the first one. This supersedes the single-success,
 > dial-once, two-second design retained below as history.
 
 ## Problem

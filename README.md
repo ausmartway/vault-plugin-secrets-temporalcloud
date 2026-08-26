@@ -318,9 +318,9 @@ Each `creds/prod-workers` read then connects to every namespace in
 `namespace_access` as the new key and waits until each namespace accepts it.
 The namespace checks run in parallel. A check returns only after five
 consecutive `DescribeNamespace` calls succeed. Each call uses a fresh gRPC
-connection, with 200 milliseconds between calls, so one accepting connection
+connection, with 100 milliseconds between calls, so one accepting connection
 cannot be mistaken for complete propagation. Any rejection resets the success
-count. Once the first check succeeds, confirmation spans at least another 800
+count. Once the first check succeeds, confirmation spans at least another 400
 milliseconds.
 
 Before enabling this option, consider these requirements:

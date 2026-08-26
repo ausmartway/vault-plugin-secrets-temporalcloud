@@ -33,10 +33,10 @@ const (
 	MaxProbeTimeout = 55 * time.Second
 
 	// probePollInterval is how often the probe re-asks. Five confirmations at
-	// 200ms span at least 800ms after the first success: long enough to sample
+	// 100ms span at least 400ms after the first success: long enough to sample
 	// several independent connections without materially delaying a credential
 	// whose key has already propagated.
-	probePollInterval = 200 * time.Millisecond
+	probePollInterval = 100 * time.Millisecond
 
 	// requiredProbeSuccesses guards against a successful response from one
 	// frontend being mistaken for complete propagation. Each confirmation uses
