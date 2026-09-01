@@ -41,8 +41,7 @@ Vault is running with the plugin mounted at $MOUNT/
 Next, configure it against your Temporal Cloud account:
 
   vault write $MOUNT/config \\
-      api_key="\$TEMPORAL_CLOUD_API_KEY" \\
-      admin_service_account_id="\$TEMPORAL_CLOUD_ADMIN_SA_ID"
+      api_key="\$TEMPORAL_CLOUD_API_KEY"
 
 Then run ./examples/demo.sh for the full walkthrough.
 Press Ctrl-C to stop Vault.

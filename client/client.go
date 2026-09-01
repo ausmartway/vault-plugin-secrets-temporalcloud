@@ -39,6 +39,11 @@ type CloudOps interface {
 	// which Temporal Cloud reveals exactly once.
 	CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey, error)
 
+	// GetAPIKey fetches a key's owner metadata. Configuration uses this to
+	// derive the root key's service account rather than asking an operator to
+	// supply an ID the API can report authoritatively.
+	GetAPIKey(ctx context.Context, id string) (*APIKeyMetadata, error)
+
 	// DeleteAPIKey deletes an API key by ID.
 	DeleteAPIKey(ctx context.Context, id string) error
 
@@ -96,6 +101,24 @@ type APIKeySpec struct {
 type APIKey struct {
 	ID    string
 	Token string
+}
+
+// APIKeyOwnerType identifies the kind of identity that owns an API key without
+// exposing Cloud API protobuf enums above this package.
+type APIKeyOwnerType string
+
+const (
+	APIKeyOwnerUnknown        APIKeyOwnerType = "unknown"
+	APIKeyOwnerUser           APIKeyOwnerType = "user"
+	APIKeyOwnerServiceAccount APIKeyOwnerType = "service-account"
+)
+
+// APIKeyMetadata is the stable subset of a key record configuration needs to
+// identify and validate the root credential's owner.
+type APIKeyMetadata struct {
+	ID        string
+	OwnerID   string
+	OwnerType APIKeyOwnerType
 }
 
 // MaxAPIKeysPerServiceAccount is Temporal Cloud's ceiling on non-expired API

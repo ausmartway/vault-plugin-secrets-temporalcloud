@@ -21,6 +21,7 @@ type stubCloudOps struct {
 	updateServiceAccountFn     func(ctx context.Context, id string, spec client.ServiceAccountSpec) error
 	deleteServiceAccountFn     func(ctx context.Context, id string) error
 	createAPIKeyFn             func(ctx context.Context, spec client.APIKeySpec) (*client.APIKey, error)
+	getAPIKeyFn                func(ctx context.Context, id string) (*client.APIKeyMetadata, error)
 	deleteAPIKeyFn             func(ctx context.Context, id string) error
 	countAPIKeysFn             func(ctx context.Context, saID string) (int, error)
 	findServiceAccountByNameFn func(ctx context.Context, name string) (*client.ServiceAccount, error)
@@ -62,6 +63,17 @@ func (s *stubCloudOps) CreateAPIKey(ctx context.Context, spec client.APIKeySpec)
 		return s.createAPIKeyFn(ctx, spec)
 	}
 	return &client.APIKey{ID: "key-stub", Token: "tmprl_sk_stub"}, nil
+}
+
+func (s *stubCloudOps) GetAPIKey(ctx context.Context, id string) (*client.APIKeyMetadata, error) {
+	if s.getAPIKeyFn != nil {
+		return s.getAPIKeyFn(ctx, id)
+	}
+	return &client.APIKeyMetadata{
+		ID:        id,
+		OwnerID:   "sa-123",
+		OwnerType: client.APIKeyOwnerServiceAccount,
+	}, nil
 }
 
 func (s *stubCloudOps) DeleteAPIKey(ctx context.Context, id string) error {
@@ -522,15 +534,19 @@ func TestConfig_FailedUpdateLeavesExistingConfigIntact(t *testing.T) {
 	}
 }
 
-// Writing config with an admin_service_account_id that does not exist in the
-// Temporal Cloud account must be rejected with a message distinct from the
-// bad-credential case, so an operator who fat-fingered the ID is pointed at
-// admin_service_account_id rather than told to check their api_key.
-func TestConfig_WriteRejectsUnknownServiceAccount(t *testing.T) {
+func TestConfig_DerivesServiceAccountOwner(t *testing.T) {
 	b, storage := newTestBackend(t)
 	stub := &stubCloudOps{
-		getServiceAccountFn: func(context.Context, string) (*client.ServiceAccount, error) {
-			return nil, client.ErrNotFound
+		getAPIKeyFn: func(_ context.Context, id string) (*client.APIKeyMetadata, error) {
+			return &client.APIKeyMetadata{
+				ID: id, OwnerID: "sa-derived", OwnerType: client.APIKeyOwnerServiceAccount,
+			}, nil
+		},
+		getServiceAccountFn: func(_ context.Context, id string) (*client.ServiceAccount, error) {
+			if id != "sa-derived" {
+				t.Fatalf("validated service account %q, want derived owner", id)
+			}
+			return &client.ServiceAccount{ID: id}, nil
 		},
 	}
 	withStubClient(b, stub)
@@ -539,33 +555,95 @@ func TestConfig_WriteRejectsUnknownServiceAccount(t *testing.T) {
 		Operation: logical.CreateOperation,
 		Path:      "config",
 		Storage:   storage,
-		Data: map[string]interface{}{
-			"api_key":                  testAPIKey("key-1"),
-			"admin_service_account_id": "sa-does-not-exist",
+		Data:      map[string]interface{}{"api_key": testAPIKey("key-1")},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("write config without admin_service_account_id: err=%v resp=%v", err, resp)
+	}
+
+	cfg, err := b.getConfig(context.Background(), storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminServiceAccountID != "sa-derived" {
+		t.Fatalf("admin service account = %q, want sa-derived", cfg.AdminServiceAccountID)
+	}
+}
+
+func TestConfig_RejectsUserOwnedAPIKey(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{
+		getAPIKeyFn: func(_ context.Context, id string) (*client.APIKeyMetadata, error) {
+			return &client.APIKeyMetadata{
+				ID: id, OwnerID: "user-123", OwnerType: client.APIKeyOwnerUser,
+			}, nil
 		},
 	})
-	if err == nil && (resp == nil || !resp.IsError()) {
-		t.Fatal("expected writing config with an unknown admin_service_account_id to fail")
-	}
 
-	// The message must name the offending ID and point at
-	// admin_service_account_id, so it reads differently from the
-	// bad-credential (ErrPermissionDenied) message.
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data:      map[string]interface{}{"api_key": testAPIKey("key-user")},
+	})
+	if err != nil || resp == nil || !resp.IsError() {
+		t.Fatalf("expected user-owned key rejection: err=%v resp=%v", err, resp)
+	}
 	msg := resp.Error().Error()
-	if !strings.Contains(msg, "sa-does-not-exist") {
-		t.Errorf("expected error to name the service account ID, got: %s", msg)
+	if !strings.Contains(msg, "owned by a Temporal Cloud user") || !strings.Contains(msg, "service-account-owned") {
+		t.Fatalf("unclear user-key error: %s", msg)
 	}
-	if !strings.Contains(msg, "admin_service_account_id") {
-		t.Errorf("expected error to mention admin_service_account_id, got: %s", msg)
+	if entry, _ := storage.Get(context.Background(), configStoragePath); entry != nil {
+		t.Fatal("user-owned key must not be stored")
 	}
+}
 
-	// Nothing may be persisted when validation fails.
-	entry, err := storage.Get(context.Background(), configStoragePath)
-	if err != nil {
-		t.Fatalf("storage get: %v", err)
+func TestConfig_RejectsMismatchedCompatibilityOwnerID(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data: map[string]interface{}{
+			"api_key":                  testAPIKey("key-1"),
+			"admin_service_account_id": "sa-wrong",
+		},
+	})
+	if err != nil || resp == nil || !resp.IsError() {
+		t.Fatalf("expected mismatched owner rejection: err=%v resp=%v", err, resp)
 	}
-	if entry != nil {
-		t.Fatal("config must not be persisted when validation fails")
+	msg := resp.Error().Error()
+	if !strings.Contains(msg, "sa-wrong") || !strings.Contains(msg, "sa-123") {
+		t.Fatalf("owner mismatch error = %s", msg)
+	}
+}
+
+func TestConfig_RejectsMissingDerivedServiceAccount(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{
+		getAPIKeyFn: func(_ context.Context, id string) (*client.APIKeyMetadata, error) {
+			return &client.APIKeyMetadata{
+				ID: id, OwnerID: "sa-missing", OwnerType: client.APIKeyOwnerServiceAccount,
+			}, nil
+		},
+		getServiceAccountFn: func(context.Context, string) (*client.ServiceAccount, error) {
+			return nil, client.ErrNotFound
+		},
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data:      map[string]interface{}{"api_key": testAPIKey("key-1")},
+	})
+	if err != nil || resp == nil || !resp.IsError() {
+		t.Fatalf("expected missing owner rejection: err=%v resp=%v", err, resp)
+	}
+	if msg := resp.Error().Error(); !strings.Contains(msg, "sa-missing") {
+		t.Fatalf("error does not name derived owner: %s", msg)
 	}
 }
 
@@ -574,9 +652,8 @@ func TestConfig_RequiredFields(t *testing.T) {
 		name string
 		data map[string]interface{}
 	}{
-		{"missing api_key", map[string]interface{}{"admin_service_account_id": "sa-1"}},
-		{"missing admin_service_account_id", map[string]interface{}{"api_key": "tmprl_sk_x"}},
-		{"empty api_key", map[string]interface{}{"api_key": "", "admin_service_account_id": "sa-1"}},
+		{"missing api_key", map[string]interface{}{}},
+		{"empty api_key", map[string]interface{}{"api_key": ""}},
 	}
 
 	for _, tc := range tests {

@@ -186,6 +186,36 @@ func (c *grpcClient) CreateAPIKey(ctx context.Context, spec APIKeySpec) (*APIKey
 	return key, nil
 }
 
+func (c *grpcClient) GetAPIKey(ctx context.Context, id string) (*APIKeyMetadata, error) {
+	resp, err := c.svc.GetApiKey(ctx, &cloudservicev1.GetApiKeyRequest{KeyId: id})
+	if err != nil {
+		return nil, MapGRPCError(err)
+	}
+
+	key := resp.GetApiKey()
+	if key == nil {
+		return nil, fmt.Errorf("%w: api key %s", ErrNotFound, id)
+	}
+	spec := key.GetSpec()
+	if spec == nil {
+		return nil, fmt.Errorf("%w: api key %s has no specification", ErrInvalidArgument, id)
+	}
+
+	ownerType := APIKeyOwnerUnknown
+	switch spec.GetOwnerType() {
+	case identityv1.OwnerType_OWNER_TYPE_USER:
+		ownerType = APIKeyOwnerUser
+	case identityv1.OwnerType_OWNER_TYPE_SERVICE_ACCOUNT:
+		ownerType = APIKeyOwnerServiceAccount
+	}
+
+	return &APIKeyMetadata{
+		ID:        key.GetId(),
+		OwnerID:   spec.GetOwnerId(),
+		OwnerType: ownerType,
+	}, nil
+}
+
 // DeleteAPIKey fetches the current ResourceVersion immediately before
 // deleting, unlike the unconditional unversioned call an earlier version of
 // this method made.

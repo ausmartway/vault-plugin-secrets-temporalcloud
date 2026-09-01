@@ -18,8 +18,6 @@ test:
 test-live:
 	@test -n "$$TEMPORAL_CLOUD_API_KEY" || \
 		(echo "TEMPORAL_CLOUD_API_KEY is not set. See README 'Running tests'."; exit 1)
-	@test -n "$$TEMPORAL_CLOUD_ADMIN_SA_ID" || \
-		(echo "TEMPORAL_CLOUD_ADMIN_SA_ID is not set. See README 'Running tests'."; exit 1)
 	go test ./... -tags=acceptance -count=1 -v -timeout 20m
 
 ## sweep: delete leftover vault-acctest- resources from failed live tests

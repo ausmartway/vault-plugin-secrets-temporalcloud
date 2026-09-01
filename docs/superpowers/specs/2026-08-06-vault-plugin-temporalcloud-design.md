@@ -1,7 +1,13 @@
 # Design: HashiCorp Vault secrets engine for Temporal Cloud
 
 **Date:** 2026-08-06
-**Status:** Approved, ready for implementation planning
+**Status:** Implemented with post-release amendments
+
+> **Root-owner derivation amendment:** `admin_service_account_id` is no longer
+> required. Vault parses the key ID, calls `GetApiKey`, rejects user-owned keys,
+> and stores the service-account owner ID Temporal Cloud reports. The field is
+> retained only as an optional compatibility check. Statements below that the
+> API cannot report ownership are superseded by this behavior.
 
 ## Problem
 

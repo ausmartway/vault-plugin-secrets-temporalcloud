@@ -34,9 +34,8 @@ type config struct {
 	// token could not be parsed, which is warned about at write time.
 	APIKeyID string `json:"api_key_id"`
 
-	// AdminServiceAccountID owns APIKey. Required because the Cloud Ops API
-	// has no whoami call: given only a token, we cannot discover which
-	// identity it belongs to, and rotate-root must mint against that identity.
+	// AdminServiceAccountID owns APIKey. It is derived from the key's Cloud Ops
+	// record during configuration so rotate-root can mint against that identity.
 	AdminServiceAccountID string `json:"admin_service_account_id"`
 
 	// Address is the Cloud Ops API host:port.
@@ -67,8 +66,9 @@ func (b *backend) pathConfig() *framework.Path {
 			// rotate-root deletes whatever this ID names, letting the two
 			// disagree is a way to destroy an unrelated key by typo.
 			"admin_service_account_id": {
-				Type:        framework.TypeString,
-				Description: "ID of the service account that owns api_key. Required: the Cloud Ops API cannot report a token's owner.",
+				Type: framework.TypeString,
+				Description: "Optional compatibility check. Vault derives the owning service account from api_key; " +
+					"if supplied, this value must match that owner.",
 			},
 			"address": {
 				Type:        framework.TypeString,
@@ -121,12 +121,7 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 				"the field and write again; 'vault read' will show the ID Vault derived."), nil
 	}
 
-	adminSAID := d.Get("admin_service_account_id").(string)
-	if adminSAID == "" {
-		return logical.ErrorResponse(
-			"admin_service_account_id is required: the Cloud Ops API cannot report which " +
-				"identity owns an API key, and rotate-root must mint against that identity"), nil
-	}
+	suppliedAdminSAID := d.Get("admin_service_account_id").(string)
 
 	existing, err := b.getConfig(ctx, req.Storage)
 	if err != nil {
@@ -204,20 +199,21 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	}
 
 	cfg := &config{
-		APIKey:                apiKey,
-		APIKeyID:              apiKeyID,
-		AdminServiceAccountID: adminSAID,
-		Address:               address,
-		RootKeyTTL:            rootKeyTTL,
+		APIKey:     apiKey,
+		APIKeyID:   apiKeyID,
+		Address:    address,
+		RootKeyTTL: rootKeyTTL,
 	}
 
-	// Validate before persisting. One GetServiceAccount call proves both that
-	// the key authenticates and that admin_service_account_id is correct, so
-	// the operator learns about a mistake now rather than at first use.
-	// Built from cfg, not from the cached client and not from `existing`: the
-	// credential under test must be the one this write is about to store, or
-	// an update would validate whatever the mount is already using and accept
-	// any key at all. TestConfig_ValidatesTheKeyBeingWritten pins this.
+	// Validate before persisting. Built from cfg, not from the cached client and
+	// not from `existing`: the credential under test must be the one this write
+	// is about to store, or an update would validate whatever the mount is
+	// already using and accept any key at all.
+	//
+	// GetAPIKey both authenticates the token and reports its owner. This removes
+	// an operator-supplied identity from the trust boundary and lets us reject a
+	// user-owned key now: rotate-root can create replacements only for service
+	// accounts.
 	c, err := b.newClient(cfg.clientConfig())
 	if err != nil {
 		return logical.ErrorResponse("could not build a Temporal Cloud client: %s", err), nil
@@ -228,21 +224,59 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		_ = c.Close()
 	}()
 
-	if _, err := c.GetServiceAccount(ctx, adminSAID); err != nil {
+	keyMetadata, err := c.GetAPIKey(ctx, apiKeyID)
+	if err != nil {
+		switch {
+		case errors.Is(err, client.ErrNotFound), errors.Is(err, client.ErrPermissionDenied):
+			return logical.ErrorResponse(
+				"the supplied api_key was rejected, expired, or lacks permission to read its own " +
+					"API key record; supply an active API key owned by a Global Admin service account"), nil
+		default:
+			return respondCloudErr("reading the supplied API key's owner", err)
+		}
+	}
+
+	switch keyMetadata.OwnerType {
+	case client.APIKeyOwnerUser:
+		return logical.ErrorResponse(
+			"the supplied api_key is owned by a Temporal Cloud user. Vault requires a " +
+				"service-account-owned API key because config/rotate-root can mint a replacement " +
+				"only for a service account"), nil
+	case client.APIKeyOwnerServiceAccount:
+		// Expected below.
+	default:
+		return logical.ErrorResponse(
+			"the supplied api_key has unsupported owner type %q; Vault requires an API key "+
+				"owned by a Temporal Cloud service account", keyMetadata.OwnerType), nil
+	}
+	if keyMetadata.OwnerID == "" {
+		return logical.ErrorResponse(
+			"Temporal Cloud returned no owner ID for the supplied api_key; Vault cannot " +
+				"rotate a key whose service account cannot be identified"), nil
+	}
+	if suppliedAdminSAID != "" && suppliedAdminSAID != keyMetadata.OwnerID {
+		return logical.ErrorResponse(
+			"admin_service_account_id %q does not own the supplied api_key; Temporal Cloud "+
+				"reports owner %q. Remove admin_service_account_id and let Vault derive it",
+			suppliedAdminSAID, keyMetadata.OwnerID), nil
+	}
+	cfg.AdminServiceAccountID = keyMetadata.OwnerID
+
+	// Reading the owner service account proves the key has the account-level
+	// access issuance and rotation need; inspecting its own key alone would not
+	// distinguish a restricted service account from a Global Admin.
+	if _, err := c.GetServiceAccount(ctx, cfg.AdminServiceAccountID); err != nil {
 		switch {
 		case errors.Is(err, client.ErrNotFound):
 			return logical.ErrorResponse(
-				"no service account %q exists in this Temporal Cloud account; "+
-					"check admin_service_account_id", adminSAID), nil
+				"Temporal Cloud reports service account %q as the api_key owner, but that "+
+					"service account does not exist", cfg.AdminServiceAccountID), nil
 		case errors.Is(err, client.ErrPermissionDenied):
 			return logical.ErrorResponse(
-				"the supplied api_key was rejected, or its service account lacks "+
-					"permission to read %q: %s", adminSAID, err), nil
+				"the supplied api_key belongs to service account %q, but it lacks Global Admin "+
+					"permission required to manage service accounts and API keys",
+				cfg.AdminServiceAccountID), nil
 		default:
-			// Everything the two branches above do not name — a malformed
-			// request, a quota, or a genuine outage — gets the engine's
-			// standard treatment: actionable problems become an error
-			// response, infrastructure failures a 500.
 			return respondCloudErr("validating the Temporal Cloud credential", err)
 		}
 	}
@@ -324,13 +358,16 @@ user-owned key could not be rotated by this engine.
 
 Updating merges against what is already stored: address and root_key_ttl keep
 their current values when omitted, so a write that only swaps the credential
-does not quietly revert them to defaults. api_key and admin_service_account_id
-are required on every write.
+does not quietly revert them to defaults. api_key is required on every write.
+admin_service_account_id is optional and retained only as a compatibility
+check; when supplied, it must match the owner Temporal Cloud reports.
 
 Nothing is stored until the credential has been proven to work. The key is
-parsed first, then used: one GetServiceAccount call on admin_service_account_id
-proves both that the key authenticates and that the ID is real and readable by
-it. A key that fails either step is rejected and nothing is persisted.
+parsed first, then used to read its own Cloud Ops record. Vault rejects a
+user-owned key and derives a service-account-owned key's owner ID from that
+record. A GetServiceAccount call on the derived owner then proves the key has
+the account-level access issuance and rotation require. A key that fails any
+step is rejected and nothing is persisted.
 
 api_key_id is read-only: returned by a read, rejected on a write. A Temporal
 Cloud API key is a JWT that names its own ID, so Vault reads the ID out of

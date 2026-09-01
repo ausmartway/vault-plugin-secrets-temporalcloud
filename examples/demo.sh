@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end walkthrough. Run after `make dev` in another terminal, with
-# TEMPORAL_CLOUD_API_KEY and TEMPORAL_CLOUD_ADMIN_SA_ID set.
+# TEMPORAL_CLOUD_API_KEY set.
 #
 # See examples/README.md for what to look at in the Temporal Cloud UI at each
 # step, and for the questions customers usually ask.
@@ -9,14 +9,12 @@ set -euo pipefail
 MOUNT="${MOUNT:-temporalcloud}"
 SA_NAME="${SA_NAME:-demo-workers}"
 : "${TEMPORAL_CLOUD_API_KEY:?set TEMPORAL_CLOUD_API_KEY}"
-: "${TEMPORAL_CLOUD_ADMIN_SA_ID:?set TEMPORAL_CLOUD_ADMIN_SA_ID}"
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 
 step "1. Configure the engine with the bootstrap credential"
 vault write "$MOUNT/config" \
-    api_key="$TEMPORAL_CLOUD_API_KEY" \
-    admin_service_account_id="$TEMPORAL_CLOUD_ADMIN_SA_ID"
+    api_key="$TEMPORAL_CLOUD_API_KEY"
 
 step "2. Rotate the root key so only Vault holds a working credential"
 vault write -f "$MOUNT/config/rotate-root"
@@ -26,7 +24,8 @@ echo "its place. No working root credential exists outside Vault any more."
 echo
 echo "Worth pausing on in a demo: Vault knew which key to delete because a Temporal"
 echo "Cloud API key is a JWT carrying its own key_id claim, so the engine reads the"
-echo "ID straight out of the key you pasted. Nobody had to look it up, and there is"
+echo "ID straight out of the key you pasted, then derived its service-account owner"
+echo "from the key's Cloud Ops record. No owner ID had to be supplied, and there is"
 echo "no window where the human-held key outlives its replacement."
 
 step "3. Create a service account in Temporal Cloud"

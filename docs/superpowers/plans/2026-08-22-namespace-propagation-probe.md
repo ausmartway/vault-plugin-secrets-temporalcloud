@@ -26,6 +26,10 @@
 > `interval` and `consecutive_successes`; each request uses one settings
 > snapshot. This supersedes the dial-once, single-success, and fixed-interval
 > steps below.
+>
+> **Implemented root-owner amendment:** Live tests no longer require
+> `TEMPORAL_CLOUD_ADMIN_SA_ID`. They derive the service-account owner from the
+> configured key's `GetApiKey` record. Older snippets below remain as history.
 
 ## Global Constraints
 

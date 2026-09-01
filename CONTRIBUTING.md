@@ -46,12 +46,11 @@ that. It reads:
 
 | Variable | Required | What it does |
 | --- | --- | --- |
-| `TEMPORAL_CLOUD_API_KEY` | Yes | The root credential the tests configure the engine with. |
-| `TEMPORAL_CLOUD_ADMIN_SA_ID` | Yes | The ID of the service account owning that key. |
+| `TEMPORAL_CLOUD_API_KEY` | Yes | The service-account-owned root credential the tests configure the engine with. Vault derives its owner ID. |
 | `TEMPORAL_CLOUD_ADDRESS` | No | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`. |
 | `TEMPORAL_CLOUD_TEST_NAMESPACE` | No | Namespace ID, such as `prod.acct1`, used by the propagation probe test. The namespace must allow API key authentication. |
 
-Three live tests are opt-in beyond the required variables:
+Three live tests are opt-in beyond the required variable:
 
 - `TestLive_RotateRoot` **deletes the API key in your environment**
   as part of proving rotation end to end. Gated behind

@@ -92,6 +92,47 @@ func (f *fakeCloudServiceClient) GetAsyncOperation(ctx context.Context, req *clo
 	return f.getAsyncOperationFn(ctx, req)
 }
 
+func TestGetAPIKeyReturnsOwnerMetadata(t *testing.T) {
+	tests := []struct {
+		name      string
+		ownerID   string
+		ownerType identityv1.OwnerType
+		wantType  APIKeyOwnerType
+	}{
+		{"service account", "sa-123", identityv1.OwnerType_OWNER_TYPE_SERVICE_ACCOUNT, APIKeyOwnerServiceAccount},
+		{"user", "user-123", identityv1.OwnerType_OWNER_TYPE_USER, APIKeyOwnerUser},
+		{"unspecified", "unknown-123", identityv1.OwnerType_OWNER_TYPE_UNSPECIFIED, APIKeyOwnerUnknown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeCloudServiceClient{
+				getApiKeyFn: func(_ context.Context, req *cloudservicev1.GetApiKeyRequest) (*cloudservicev1.GetApiKeyResponse, error) {
+					if req.GetKeyId() != "key-123" {
+						t.Fatalf("key id = %q", req.GetKeyId())
+					}
+					return &cloudservicev1.GetApiKeyResponse{ApiKey: &identityv1.ApiKey{
+						Id: "key-123",
+						Spec: &identityv1.ApiKeySpec{
+							OwnerId:   tc.ownerID,
+							OwnerType: tc.ownerType,
+						},
+					}}, nil
+				},
+			}
+			c := &grpcClient{svc: fake}
+
+			got, err := c.GetAPIKey(context.Background(), "key-123")
+			if err != nil {
+				t.Fatalf("GetAPIKey: %v", err)
+			}
+			if got.ID != "key-123" || got.OwnerID != tc.ownerID || got.OwnerType != tc.wantType {
+				t.Fatalf("metadata = %+v", got)
+			}
+		})
+	}
+}
+
 // TestFindServiceAccountByName_Found covers the ordinary match, including
 // that the SINGULAR getter (GetServiceAccount, despite the plural field) is
 // what carries the results.

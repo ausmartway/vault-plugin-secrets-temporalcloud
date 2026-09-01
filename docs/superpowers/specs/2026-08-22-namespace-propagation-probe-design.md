@@ -19,6 +19,11 @@
 > `interval` and `consecutive_successes`; every request uses one stored settings
 > snapshot. This supersedes the single-success, dial-once, fixed-interval design
 > retained below as history.
+>
+> **Root-owner derivation amendment:** Live tests no longer require
+> `TEMPORAL_CLOUD_ADMIN_SA_ID`; configuration and the probe test derive the
+> service-account owner from `GetApiKey`. Older test instructions below are
+> retained as history.
 
 ## Problem
 

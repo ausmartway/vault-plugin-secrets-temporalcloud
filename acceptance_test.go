@@ -31,9 +31,8 @@ func liveBackend(t *testing.T) (*backend, logical.Storage) {
 	t.Helper()
 
 	apiKey := os.Getenv("TEMPORAL_CLOUD_API_KEY")
-	adminSAID := os.Getenv("TEMPORAL_CLOUD_ADMIN_SA_ID")
-	if apiKey == "" || adminSAID == "" {
-		t.Skip("set TEMPORAL_CLOUD_API_KEY and TEMPORAL_CLOUD_ADMIN_SA_ID to run live tests")
+	if apiKey == "" {
+		t.Skip("set TEMPORAL_CLOUD_API_KEY to run live tests")
 	}
 
 	conf := logical.TestBackendConfig()
@@ -46,8 +45,7 @@ func liveBackend(t *testing.T) (*backend, logical.Storage) {
 	}
 
 	data := map[string]interface{}{
-		"api_key":                  apiKey,
-		"admin_service_account_id": adminSAID,
+		"api_key": apiKey,
 	}
 	if addr := os.Getenv("TEMPORAL_CLOUD_ADDRESS"); addr != "" {
 		data["address"] = addr
@@ -173,21 +171,29 @@ func TestLive_ProbeConfigLifecycle(t *testing.T) {
 	}
 }
 
-func TestLive_ConfigRejectsBadServiceAccountID(t *testing.T) {
-	b, _ := liveBackend(t)
+func TestLive_ConfigDerivesOwnerAndRejectsMismatch(t *testing.T) {
+	b, storage := liveBackend(t)
 
-	storage := &logical.InmemStorage{}
+	cfg, err := b.getConfig(context.Background(), storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminServiceAccountID == "" {
+		t.Fatal("expected config to derive the API key owner")
+	}
+
+	otherStorage := &logical.InmemStorage{}
 	resp, err := b.HandleRequest(context.Background(), &logical.Request{
 		Operation: logical.CreateOperation,
 		Path:      "config",
-		Storage:   storage,
+		Storage:   otherStorage,
 		Data: map[string]interface{}{
 			"api_key":                  os.Getenv("TEMPORAL_CLOUD_API_KEY"),
-			"admin_service_account_id": "definitely-not-a-real-service-account-id",
+			"admin_service_account_id": "definitely-not-the-derived-owner",
 		},
 	})
-	if err == nil && (resp == nil || !resp.IsError()) {
-		t.Fatal("expected a nonexistent admin_service_account_id to be rejected")
+	if err != nil || resp == nil || !resp.IsError() {
+		t.Fatalf("expected mismatched admin_service_account_id rejection: err=%v resp=%v", err, resp)
 	}
 }
 
@@ -619,11 +625,10 @@ func TestLive_CountDisabledKey(t *testing.T) {
 // timeout.
 func TestLive_ProbePropagation(t *testing.T) {
 	apiKey := os.Getenv("TEMPORAL_CLOUD_API_KEY")
-	adminSAID := os.Getenv("TEMPORAL_CLOUD_ADMIN_SA_ID")
 	namespace := os.Getenv("TEMPORAL_CLOUD_TEST_NAMESPACE")
-	if apiKey == "" || adminSAID == "" || namespace == "" {
-		t.Skip("set TEMPORAL_CLOUD_API_KEY, TEMPORAL_CLOUD_ADMIN_SA_ID, and " +
-			"TEMPORAL_CLOUD_TEST_NAMESPACE (e.g. prod.acct1) to run this")
+	if apiKey == "" || namespace == "" {
+		t.Skip("set TEMPORAL_CLOUD_API_KEY and TEMPORAL_CLOUD_TEST_NAMESPACE " +
+			"(e.g. prod.acct1) to run this")
 	}
 
 	ctx := context.Background()
@@ -643,8 +648,20 @@ func TestLive_ProbePropagation(t *testing.T) {
 	// still has a live connection to use.
 	t.Cleanup(func() { _ = c.Close() })
 
+	rootKeyID, err := client.APIKeyIDFromToken(apiKey)
+	if err != nil {
+		t.Fatalf("read root API key ID: %v", err)
+	}
+	rootMetadata, err := c.GetAPIKey(ctx, rootKeyID)
+	if err != nil {
+		t.Fatalf("derive root API key owner: %v", err)
+	}
+	if rootMetadata.OwnerType != client.APIKeyOwnerServiceAccount {
+		t.Fatalf("root API key owner type = %s, want service-account", rootMetadata.OwnerType)
+	}
+
 	key, err := c.CreateAPIKey(ctx, client.APIKeySpec{
-		ServiceAccountID: adminSAID,
+		ServiceAccountID: rootMetadata.OwnerID,
 		DisplayName:      fmt.Sprintf("vault-probe-test-%d", time.Now().UnixNano()),
 		Description:      "Transient key for TestLive_ProbePropagation",
 		ExpiryTime:       time.Now().Add(client.MinAPIKeyExpiry + time.Hour),

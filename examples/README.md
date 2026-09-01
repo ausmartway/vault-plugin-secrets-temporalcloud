@@ -10,13 +10,11 @@ Cloud Ops API call.
 - `vault` on your `PATH` (`brew install vault`)
 - Go, to build the plugin
 - A Temporal Cloud API key for a service account with the **Global Admin**
-  role, and that service account's ID. This is the bootstrap credential —
-  step 2 immediately replaces it with one Vault mints itself, so it does not
-  need to be long-lived.
+  role. This is the bootstrap credential — step 2 immediately replaces it with
+  one Vault mints itself, so it does not need to be long-lived.
 
 ```bash
 export TEMPORAL_CLOUD_API_KEY="eyJhbGciOiJFUzI1NiIs..."
-export TEMPORAL_CLOUD_ADMIN_SA_ID="<service account id>"
 ```
 
 **Step 2 deletes the key you pasted in step 1, and that is the moment worth
@@ -26,10 +24,9 @@ point no working root credential exists outside Vault.
 
 Vault knows which key to delete because a Temporal Cloud API key is a JWT that
 carries its own `key_id` claim, so the engine reads the ID straight out of the
-key you handed it. Nobody looks anything up, and there is no window where the
-human-held credential outlives its replacement. If someone asks how it knows,
-decoding the middle segment of any API key on screen answers it in about ten
-seconds.
+key you handed it. It then reads that key's Cloud Ops record to derive the
+owning service account. Nobody supplies an owner ID, and there is no window
+where the human-held credential outlives its replacement.
 
 ## Run it
 

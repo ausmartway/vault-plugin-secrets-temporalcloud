@@ -39,7 +39,7 @@ You need:
 - **A Vault server** you can register external plugins on: a configured
   `plugin_directory`, and permission to run `vault plugin register`.
 - **A Temporal Cloud API key owned by a service account** with the Global Admin
-  (or Account Owner) role, plus that service account's ID.
+  (or Account Owner) role.
 
 Two things about that credential are worth getting right up front, because both
 are awkward to change later:
@@ -156,29 +156,30 @@ using a credential that rotation has deleted. For more information, see
 
 ```bash
 vault write temporalcloud/config \
-    api_key="eyJhbGciOiJFUzI1NiIs..." \
-    admin_service_account_id="<service account id>"
+    api_key="eyJhbGciOiJFUzI1NiIs..."
 ```
 
-`admin_service_account_id` is required because the Cloud Ops API has no
-"whoami" call — given only a token, there is no way to discover which identity
-it belongs to, and rotation needs that identity to mint a replacement.
+Vault reads the key's own Cloud Ops record to determine whether a user or a
+service account owns it and to derive the service account ID rotation needs. A
+user-owned key is rejected with a message explaining that `rotate-root` cannot
+mint a replacement for a user identity.
 
 **Nothing is stored until the credential has been proven to work.** The write
 is checked in two stages and fails at whichever comes first:
 
 1. **The key is parsed.** A Temporal Cloud API key is a JWT; the engine reads
    the key's own ID out of it. A key it cannot parse is rejected.
-2. **The key is used.** The engine dials Temporal Cloud and reads
-   `admin_service_account_id` back. That single call proves both that the key
-   authenticates and that the ID is real and readable by it.
+2. **The key record is inspected.** The engine dials Temporal Cloud, reads the
+   key by its parsed ID, and rejects it unless its owner is a service account.
+   The owner ID comes from this record, not from operator input.
+3. **The owner is read.** Reading the derived service account proves the key has
+   the account-level access issuance and rotation require.
 
-Only then is anything persisted. Four mistakes fail at write time, each with a
-message naming which one: a wrong key, an expired key, a key whose service
-account lacks Global Admin, and a mistyped `admin_service_account_id`. None of
-them fails silently, and none waits for a later credential request. A rejected
-update leaves the previous configuration exactly as it was, so a bad write
-cannot break a working mount.
+Only then is anything persisted. A wrong, expired, user-owned, or insufficiently
+privileged key fails at write time with a message naming the problem. None fails
+silently or waits for a later credential request. A rejected update leaves the
+previous configuration exactly as it was, so a bad write cannot break a working
+mount.
 
 ### 2. Rotate it immediately
 
@@ -495,8 +496,9 @@ cannot be shorter than 24 hours.
 | `the Temporal Cloud secrets engine is not configured` | No `config` written on this mount | Write `config` |
 | `api_key does not look like a Temporal Cloud API key` | Truncated paste, or not an API key | Re-copy the whole key |
 | `api_key_id is read-only and cannot be set` | Supplied a field Vault derives itself | Remove it from the write |
-| `no service account "…" exists in this Temporal Cloud account` | `admin_service_account_id` is wrong | Check the ID in the Temporal Cloud console |
-| `the supplied api_key was rejected, or its service account lacks permission` | Key expired, revoked, or its account lacks Global Admin | Write `config` with a fresh key |
+| `the supplied api_key is owned by a Temporal Cloud user` | The key cannot be rotated through `CreateApiKey` | Supply a service-account-owned key |
+| `admin_service_account_id … does not own the supplied api_key` | An optional compatibility value disagrees with Temporal Cloud | Remove `admin_service_account_id` and let Vault derive it |
+| `the supplied api_key was rejected…` | Key expired, revoked, or unable to read its own record | Write `config` with a fresh service-account key |
 | `The configured root API key was rejected…` on a `creds/` read | The mount's own root key has expired or been revoked | Write `config` with a fresh key, then rotate |
 | `no service account named "…" is configured` | Reading `creds/<name>` with no matching entry | Create `service-accounts/<name>` first |
 | `…has 20 of 20 permitted API keys in use` | Ceiling reached | Revoke leases, lower `ttl`, or add a service account |
@@ -512,15 +514,14 @@ cannot be shorter than 24 hours.
 | Field | Description |
 | --- | --- |
 | `api_key` | **Required.** API key owned by a Global Admin service account. Never returned by a read. |
-| `admin_service_account_id` | **Required.** ID of the service account owning `api_key`. |
+| `admin_service_account_id` | **Optional compatibility check.** When supplied, it must match the owner Vault derives from `api_key`. Returned by reads. |
 | `address` | Cloud Ops API host:port. Defaults to `saas-api.tmprl.cloud:443`. Override for PrivateLink or non-production endpoints. |
 | `root_key_ttl` | Expiry for keys minted by `rotate-root`. Default 90 days. Minimum 24 hours, maximum two years; a value outside that is rejected at write time rather than at rotation time. |
 | `api_key_id` | **Read-only.** Returned by a read, rejected on a write. |
 
 Updates merge: `address` and `root_key_ttl` keep their stored values when
 omitted, so swapping the credential does not silently revert a PrivateLink
-address to the public endpoint. `api_key` and `admin_service_account_id` are
-required on every write.
+address to the public endpoint. Only `api_key` is required on every write.
 
 `api_key_id` is read-only because the key already carries it — a Temporal Cloud
 API key is a JWT whose payload names its own ID. The engine reads it from the

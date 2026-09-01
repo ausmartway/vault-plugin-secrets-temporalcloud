@@ -10,6 +10,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-06-vault-plugin-temporalcloud-design.md` — read it before starting. It records why each decision was made, which this plan does not repeat.
 
+> **Implemented root-owner amendment:** `admin_service_account_id` is no longer
+> required. Configuration reads the key's Cloud Ops record, rejects user-owned
+> keys, and derives the service-account owner ID. The field remains only as an
+> optional compatibility check. Original steps below are retained as history
+> and are superseded where they require the owner ID.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section.
