@@ -7,6 +7,10 @@ import (
 )
 
 func TestCredentialRequestContext(t *testing.T) {
+	if credentialRequestTimeout != 55*time.Second {
+		t.Fatalf("credentialRequestTimeout = %s, want 55s", credentialRequestTimeout)
+	}
+
 	t.Run("caps a context with no deadline", func(t *testing.T) {
 		started := time.Now()
 		ctx, cancel := credentialRequestContext(context.Background())

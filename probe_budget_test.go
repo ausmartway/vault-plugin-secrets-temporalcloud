@@ -36,6 +36,16 @@ func TestProbeBudget(t *testing.T) {
 			wantAtMost:   client.MaxProbeTimeout,
 		},
 		{
+			// A representative eight-second key creation leaves about 47 seconds
+			// of the 55-second end-to-end budget. The probe must use that remainder,
+			// not add its 50-second ceiling on top of the elapsed creation time.
+			name:         "eight-second creation leaves about 47 seconds",
+			deadlineLeft: credentialRequestTimeout - 8*time.Second,
+			wantOK:       true,
+			wantAtLeast:  46 * time.Second,
+			wantAtMost:   47 * time.Second,
+		},
+		{
 			// Earlier Cloud Ops work consumes the same end-to-end budget. The
 			// probe gets exactly what remains because the enclosing credential
 			// deadline already reserves delivery headroom.

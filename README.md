@@ -379,7 +379,8 @@ Updates merge, so omit a field to retain its current value. Delete
 `consecutive_successes` accepts 1 through 20. Vault rejects a combination whose
 minimum confirmation window would consume the 50-second probe budget.
 
-Before enabling this option, consider these requirements:
+Propagation verification is enabled by default. Ensure these requirements are
+met, or explicitly set `verify_propagation=false` for the entry:
 
 - **Allow egress to the namespace frontends.** The Vault node must reach
   `<namespace>.tmprl.cloud:7233`. This destination differs from the
