@@ -66,7 +66,7 @@ Download the archive for your platform from the
 Below is a script that illustrate steps to register/enable the plugin.
 
 ```bash
-VERSION=0.3.0
+VERSION=0.3.1
 OS=linux ARCH=amd64                       # or darwin / arm64
 
 # 1. verify the download
