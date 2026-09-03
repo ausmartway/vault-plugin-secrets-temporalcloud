@@ -38,6 +38,39 @@ You need:
 - **A Temporal Cloud API key owned by a service account** with the Global Admin
   role.
 
+Create the bootstrap identity and key with the Temporal CLI while logged in as
+an Account Owner or Global Admin:
+
+```bash
+# Authenticate the Temporal Cloud CLI as an administrator.
+temporal cloud login
+
+# Create a dedicated machine identity with the recommended role.
+temporal cloud service-account create \
+    --name vault-secrets-engine \
+    --description "Root identity for the Vault Temporal Cloud secrets engine" \
+    --account-role admin
+
+# Copy the service account ID printed by the command above.
+VAULT_SERVICE_ACCOUNT_ID="<service-account-id>"
+
+# Create its short-lived bootstrap key. The token is displayed only once.
+temporal cloud apikey create-for-service-account \
+    --service-account-id "$VAULT_SERVICE_ACCOUNT_ID" \
+    --display-name vault-secrets-engine-bootstrap \
+    --description "Disposable bootstrap key for Vault" \
+    --expiry-duration 7d
+
+# Copy the displayed token for the config write later in this guide.
+export TEMPORAL_CLOUD_API_KEY="<api-key-token>"
+```
+
+The API key has no separate role: it inherits Global Admin from its owning
+service account. Seven days is intentionally short because
+`config/rotate-root` replaces and deletes this bootstrap key immediately after
+Vault is configured. You do not need to pass `VAULT_SERVICE_ACCOUNT_ID` to the
+plugin; Vault derives it from the API key's Cloud Ops record.
+
 Two things about that credential are worth getting right up front, because both
 are awkward to change later:
 
@@ -154,7 +187,7 @@ using a credential that rotation has deleted. For more information, see
 
 ```bash
 vault write temporalcloud/config \
-    api_key="eyJhbGciOiJFUzI1NiIs..."
+    api_key="$TEMPORAL_CLOUD_API_KEY"
 ```
 
 Vault reads the key's own Cloud Ops record to determine whether a user or a
