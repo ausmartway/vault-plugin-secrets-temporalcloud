@@ -11,21 +11,25 @@
 **Spec:** `docs/superpowers/specs/2026-08-22-namespace-propagation-probe-design.md`
 
 > **Implemented timeout amendment:** Benchmarking after this plan was written
-> raised `client.MaxProbeTimeout` to 55s and added a 55s end-to-end credential
-> work deadline, leaving five seconds below the Vault API client's 60s timeout.
-> `probeBudget` no longer subtracts its own safety margin because that would
-> double-count the delivery headroom. The original steps below remain as
-> implementation history and are superseded on these timeout values.
+> added a 55s end-to-end credential work deadline, leaving five seconds below
+> the Vault API client's 60s timeout. The namespace-probe portion is capped at
+> 50s and uses less when key creation consumes part of the request deadline.
+> The original steps below remain as implementation history.
 >
 > **Implemented consistency and interval amendment:** A later test showed that
 > one success did not guarantee a subsequent connection would work.
-> `ProbeNamespace` now requires five consecutive successes and creates a fresh
-> gRPC connection for every attempt. Any failure resets the count. Attempts
-> were initially two seconds apart, then tuned to defaults of 50ms and eight
+> `ProbeNamespace` now requires configurable consecutive successes and creates
+> a fresh gRPC connection for every attempt. Any failure resets the count. Attempts
+> were initially two seconds apart, then tuned to defaults of 50ms and ten
 > successes. Those defaults are mount-configurable through `config/probe` as
 > `interval` and `consecutive_successes`; each request uses one settings
 > snapshot. This supersedes the dial-once, single-success, and fixed-interval
 > steps below.
+>
+> **Implemented default-on amendment:** New service-account entries now default
+> `verify_propagation` to `true`; an explicit `false` opts out. Existing stored
+> values remain unchanged. Default-off implementation steps below are retained
+> as history.
 >
 > **Implemented root-owner amendment:** Live tests no longer require
 > `TEMPORAL_CLOUD_ADMIN_SA_ID`. They derive the service-account owner from the

@@ -4,21 +4,25 @@
 **Status:** Implemented with post-release amendments
 
 > **Timeout amendment:** External 500-trial benchmarks observed maxima of
-> 43.368s and 46.670s. Credential work is therefore bounded to 55s from handler
-> entry, five seconds below the Vault API client's default 60s timeout. The
-> probe may use the full remainder of that 55s budget, up to 55s; it does not
-> subtract a second safety margin. The original 50s/90s-server-deadline design
-> below is retained as decision history and is superseded on this point.
+> 43.368s and 46.670s. Credential work is bounded to 55s from handler entry,
+> five seconds below the Vault API client's default 60s timeout. Namespace
+> probing uses the remaining request time after key creation, capped at 50s.
+> The original 90s-server-deadline design below is retained as history.
 >
 > **Consistency and interval amendment:** One successful call did not prove that
-> subsequent connections would work. The implemented probe now requires five
-> consecutive `DescribeNamespace` successes. Every attempt creates and closes
+> subsequent connections would work. The implemented probe now requires a
+> configurable number of consecutive `DescribeNamespace` successes. Every attempt creates and closes
 > its own gRPC connection, and any failure resets the count. Attempts were
-> initially two seconds apart, then tuned to defaults of 50ms and eight
+> initially two seconds apart, then tuned to defaults of 50ms and ten
 > successes. Those defaults are mount-configurable through `config/probe` as
 > `interval` and `consecutive_successes`; every request uses one stored settings
 > snapshot. This supersedes the single-success, dial-once, fixed-interval design
 > retained below as history.
+>
+> **Default-on amendment:** New service-account entries now default
+> `verify_propagation` to `true`; operators may explicitly set it to `false` to
+> opt out. Existing stored values remain unchanged. The original default-off
+> rationale below is superseded.
 >
 > **Root-owner derivation amendment:** Live tests no longer require
 > `TEMPORAL_CLOUD_ADMIN_SA_ID`; configuration and the probe test derive the

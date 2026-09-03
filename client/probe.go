@@ -30,19 +30,19 @@ const (
 	// the real budget from the remaining request deadline, so a slow
 	// CreateAPIKey shortens the probe instead of pushing the request past
 	// Vault's timeout.
-	MaxProbeTimeout = 55 * time.Second
+	MaxProbeTimeout = 50 * time.Second
 
 	// DefaultProbeInterval is how often the probe re-asks unless the mount
-	// overrides it. Eight confirmations at 50ms span at least 350ms after the
+	// overrides it. Ten confirmations at 50ms span at least 450ms after the
 	// first success: long enough to sample several independent connections
 	// without materially delaying a credential whose key has already propagated.
 	DefaultProbeInterval = 50 * time.Millisecond
 
 	// DefaultProbeSuccesses guards against a successful response from one
 	// frontend being mistaken for complete propagation. Each confirmation uses
-	// a fresh connection, so eight in a row demonstrate that acceptance is not
+	// a fresh connection, so ten in a row demonstrate that acceptance is not
 	// limited to one connection or one backend reached through the endpoint.
-	DefaultProbeSuccesses = 8
+	DefaultProbeSuccesses = 10
 )
 
 // namespaceEndpoint builds the gRPC address for a namespace.
@@ -105,8 +105,8 @@ func DefaultProbeSettings() ProbeSettings {
 // ProbeNamespace reports whether a namespace frontend consistently accepts
 // token and honours the grant it carries.
 //
-// It returns nil after five consecutive DescribeNamespace calls succeed, each
-// over a fresh gRPC connection. A retryable failure resets the success count;
+// It returns nil after the configured number of consecutive DescribeNamespace
+// calls succeed, each over a fresh gRPC connection. A retryable failure resets the success count;
 // an error is returned if the context ends first or the frontend answers with
 // something no amount of waiting will clear. Callers treat the error as
 // advisory: this never decides whether a credential is issued.

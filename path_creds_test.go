@@ -718,8 +718,7 @@ func mustReadCreds(t *testing.T, b *backend, storage logical.Storage, name strin
 	return resp
 }
 
-// The flag is off by default, and an existing mount must not start making
-// network calls to namespace frontends because it upgraded.
+// An explicit opt-out must prevent network calls to namespace frontends.
 func TestCreds_NoProbeWhenFlagOff(t *testing.T) {
 	b, storage := newTestBackend(t)
 	stub := &stubCloudOps{}
@@ -736,22 +735,23 @@ func TestCreds_NoProbeWhenFlagOff(t *testing.T) {
 
 	mustWriteConfig(t, b, storage)
 	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
-		"account_role":     "developer",
-		"namespace_access": "prod.acct1=write",
+		"account_role":       "developer",
+		"namespace_access":   "prod.acct1=write",
+		"verify_propagation": false,
 	})
 
 	resp := mustReadCreds(t, b, storage, "prod-workers")
 
 	if probed != 0 {
-		t.Fatalf("probed %d times with the flag off, want 0", probed)
+		t.Fatalf("probed %d times after explicit opt-out, want 0", probed)
 	}
 	if len(resp.Warnings) != 0 {
 		t.Fatalf("unexpected warnings: %v", resp.Warnings)
 	}
 }
 
-// Every granted namespace is probed, not a representative sample: a key can
-// reach one cell and not another.
+// Every granted namespace is probed by default, not a representative sample:
+// a key can reach one cell and not another.
 func TestCreds_ProbesEveryGrantedNamespace(t *testing.T) {
 	b, storage := newTestBackend(t)
 	stub := &stubCloudOps{}
@@ -771,9 +771,8 @@ func TestCreds_ProbesEveryGrantedNamespace(t *testing.T) {
 
 	mustWriteConfig(t, b, storage)
 	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
-		"account_role":       "developer",
-		"namespace_access":   "prod.acct1=write,staging.acct1=read",
-		"verify_propagation": true,
+		"account_role":     "developer",
+		"namespace_access": "prod.acct1=write,staging.acct1=read",
 	})
 
 	resp := mustReadCreds(t, b, storage, "prod-workers")

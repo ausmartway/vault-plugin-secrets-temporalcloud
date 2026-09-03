@@ -8,9 +8,6 @@ This document is for the Vault administrator who installs, configures, and
 operates the mount. For changing the plugin itself, see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Every path in this document is exercised against a real Temporal Cloud account
-by a live acceptance suite, not against mocks alone.
-
 ## Why run this
 
 Temporal Cloud API keys are static credentials with a few sharp edges:
@@ -44,12 +41,13 @@ You need:
 Two things about that credential are worth getting right up front, because both
 are awkward to change later:
 
-> **It must be a service-account key, not a user key.** Temporal Cloud's
-> `CreateApiKey` only supports service-account owners, so there is no way to
-> mint a replacement for a user identity. Hand this engine a user-owned key and
-> `rotate-root` has nothing it can do.
+> **It must be a service-account key, not a user key.** From security point of
+> view, humans and machines identities are very different in nature and should
+> never be mixed.
+> Technically, the Temporal Cloud `CreateApiKey` api only supports service-
+> account owners, so there is no way to mint a replacement for a user identity.
 >
-> **Treat the key you paste in as disposable.** The first thing you do after
+> **Treat the root api key you paste in as disposable.** The first thing you do after
 > configuring the mount is rotate it away, which deletes it. That is the
 > point: from then on, no working root credential has ever existed outside
 > Vault.
@@ -59,10 +57,7 @@ are awkward to change later:
 Download the archive for your platform from the
 [releases page](https://github.com/ausmartway/vault-plugin-secrets-temporalcloud/releases).
 
-**There are two different checksums involved, and confusing them is the usual
-reason registration fails.** The published `_SHA256SUMS` file covers the
-*archives* and proves your download arrived intact. Vault instead verifies the
-hash of the *extracted binary*.
+Below is a script that illustrate steps to register/enable the plugin.
 
 ```bash
 VERSION=0.3.0
@@ -84,9 +79,6 @@ vault plugin register -sha256="$SHA" \
 
 vault secrets enable -path=temporalcloud vault-plugin-secrets-temporalcloud
 ```
-
-Binaries are statically linked (`CGO_ENABLED=0`), so they do not depend on the
-Vault host's libc.
 
 **Confirming what you installed.** Vault gives you no way to ask a registered
 plugin which build it is running, so ask the binary directly:
@@ -231,9 +223,7 @@ vault read temporalcloud/service-accounts/prod-workers
 
 ### Two behaviours that surprise people
 
-Both change live state in Temporal Cloud, not just what Vault has stored.
-
-**Create requires the spec; update merges.** The first write needs
+**On creation account_role is required, update merges.** The first write needs
 `account_role` at minimum. Every write after that changes only the fields you
 pass — omit one and it keeps its stored value. So this changes the role and
 nothing else:
@@ -253,7 +243,7 @@ vault write temporalcloud/service-accounts/prod-workers namespace_access=""
 That reaches Temporal Cloud and revokes every namespace permission the account
 had. It is not a Vault-side bookkeeping change.
 
-**A name that already exists in Temporal Cloud fails, unless you force it.**
+**A service account name that already exists in Temporal Cloud fails, unless you force it.**
 Service-account names are unique across active accounts. If the name is taken —
 by a colleague, a previous mount, or something made by hand in the console —
 the write fails and names the colliding account's ID. `force=true` adopts that
@@ -289,11 +279,7 @@ service_account_name   prod-workers
 The token appears **once**. Vault does not store it and cannot show it again —
 read the path again for a new key.
 
-| Lease event | What happens in Temporal Cloud |
-| --- | --- |
-| Read | A fresh API key is minted, then read back to confirm it exists before the token is returned |
-| Renew | Nothing. Renewal is Vault-side only — the key already outlives any extension Vault can grant |
-| Revoke / expire | Vault deletes the key, then confirms the deletion by reading it back |
+The api key lifecycle is tired to a Vault lease and when the lease is [expired/revoked](https://developer.hashicorp.com/vault/docs/concepts/lease), the api key will be expired/revolved with it.
 
 ### Verify key propagation
 
@@ -305,15 +291,17 @@ A worker does not necessarily recover from that delay. Temporal SDKs treat
 `Unauthenticated` and `PermissionDenied` as non-retryable and can fail on the
 first connection instead of reconnecting.
 
-Set `verify_propagation=true` on a service account entry to check the key before
-returning it:
+Propagation verification is enabled by default on every new service account
+entry. This entry checks the key before returning it:
 
 ```bash
 vault write temporalcloud/service-accounts/prod-workers \
     account_role=developer \
-    namespace_access=prod.acct1=write \
-    verify_propagation=true
+    namespace_access=prod.acct1=write
 ```
+
+Set `verify_propagation=false` explicitly if a Vault node cannot reach namespace
+frontends or you need to opt an entry out.
 
 Each `creds/prod-workers` read then connects to every namespace in
 `namespace_access` as the new key and waits until each namespace accepts it.
@@ -321,21 +309,21 @@ The namespace checks run in parallel. A check returns only after the configured
 number of consecutive `DescribeNamespace` calls succeed. Each call uses a fresh
 gRPC connection, so one accepting connection cannot be mistaken for complete
 propagation. Any rejection resets the success count. By default, attempts are
-50 milliseconds apart and eight successes are required, so confirmation spans
-at least 350 milliseconds after the first success.
+50 milliseconds apart and 10 successes are required, so confirmation spans
+at least 450 milliseconds after the first success.
 
 Tune those defaults for the whole mount through `config/probe`:
 
 ```bash
 vault write temporalcloud/config/probe \
     interval=250ms \
-    consecutive_successes=8
+    consecutive_successes=15
 ```
 
 Updates merge, so omit a field to retain its current value. Delete
 `config/probe` to restore the defaults. `interval` accepts 50ms through 5s, and
 `consecutive_successes` accepts 1 through 20. Vault rejects a combination whose
-minimum confirmation window would consume the 55-second probe budget.
+minimum confirmation window would consume the 50-second probe budget.
 
 Before enabling this option, consider these requirements:
 
@@ -355,10 +343,10 @@ check. Credential reads from that entry warn that nothing was verified.
 
 Credential work under `creds/<name>` is bounded to 55 seconds, leaving five
 seconds for Vault to serialize and deliver the response before its API client's
-default 60-second HTTP timeout. The probe uses whatever remains of that
-55-second budget after key creation and never waits longer than 55 seconds. If
-too little time remains, Vault returns the credential with a warning instead of
-risking a client-side timeout.
+default 60-second HTTP timeout. The probe uses whatever remains of that request
+budget after key creation, capped at 50 seconds. If too little time remains,
+Vault returns the credential with a warning instead of risking a client-side
+timeout.
 
 If you raise `max_ttl` on an entry that has outstanding leases, those leases
 keep the ceiling their own keys were minted under. Temporal Cloud fixes an API
@@ -535,13 +523,13 @@ names, so accepting one would be a way to destroy an unrelated key by typo.
 | Field | Description |
 | --- | --- |
 | `interval` | Delay between attempts. Default `50ms`; minimum `50ms`, maximum `5s`. |
-| `consecutive_successes` | Successful attempts required in a row. Default `8`; minimum `1`, maximum `20`. |
+| `consecutive_successes` | Successful attempts required in a row. Default `10`; minimum `1`, maximum `20`. |
 
 The settings apply to every entry on this mount with `verify_propagation=true`.
 Updates merge. Delete the path to restore both defaults. Every attempt uses a
 fresh gRPC connection, and a failed attempt resets the consecutive-success
 count. The minimum window, `(consecutive_successes - 1) × interval`, must remain
-below the 55-second probe budget.
+below the 50-second probe budget.
 
 ### `config/rotate-root`
 
@@ -557,7 +545,7 @@ deletes the old one.
 | `description` | Shown in the Temporal Cloud UI. Defaults to `Managed by Vault mount <mount>`. |
 | `ttl` | Default lease TTL for keys issued here. Default 1 hour. |
 | `max_ttl` | Maximum lease TTL. Also drives the key's Temporal Cloud expiry. Default 24 hours. |
-| `verify_propagation` | Before returning a credential, wait for every namespace in `namespace_access` to accept the new key. Default `false`. See [Verify key propagation](#verify-key-propagation). |
+| `verify_propagation` | Before returning a credential, wait for every namespace in `namespace_access` to accept the new key. Default `true`; set `false` to opt out. See [Verify key propagation](#verify-key-propagation). |
 | `force` | Create only. Adopt an existing Temporal Cloud account of the same name instead of failing. |
 
 Supports `read`, `delete`, and `list`.
@@ -572,7 +560,7 @@ lease.
 `examples/demo.sh` walks the full lifecycle against a dev-mode Vault:
 configure, rotate the bootstrap key away, create a service account, mint a
 credential, revoke it, tear down. See
-[`examples/README.md`](examples/README.md) for what to watch in the Temporal
+[`examples/README.md`](exmples/README.md) for what to watch in the Temporal
 Cloud UI at each step — it is written for demoing this to someone.
 
 ## License

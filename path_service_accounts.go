@@ -103,14 +103,16 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 					"deletes it in Temporal Cloud too. Ignored when updating an entry Vault already manages.",
 			},
 			"verify_propagation": {
-				Type: framework.TypeBool,
+				Type:    framework.TypeBool,
+				Default: true,
 				Description: "Before returning a credential, verify that every namespace in " +
 					"namespace_access accepts the newly minted key. Temporal Cloud distributes keys " +
 					"asynchronously, so a key the Cloud Ops API reports as created is not yet accepted " +
 					"everywhere; a worker handed one fails at startup rather than retrying. This requires " +
-					"five consecutive checks over fresh connections per namespace and egress from the " +
+					"the configured number of consecutive checks (ten by default) over fresh " +
+					"connections per namespace and egress from the " +
 					"Vault node to <namespace>.tmprl.cloud:7233. On timeout the credential is still returned, with a " +
-					"warning naming the namespace. Defaults to false.",
+					"warning naming the namespace. Defaults to true; set false to opt out.",
 			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{

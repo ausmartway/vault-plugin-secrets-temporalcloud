@@ -14,12 +14,15 @@ import (
 )
 
 func TestDefaultProbeSettings(t *testing.T) {
+	if MaxProbeTimeout != 50*time.Second {
+		t.Fatalf("MaxProbeTimeout = %s, want 50s", MaxProbeTimeout)
+	}
 	settings := DefaultProbeSettings()
 	if settings.Interval != 50*time.Millisecond {
 		t.Fatalf("Interval = %s, want 50ms", settings.Interval)
 	}
-	if settings.ConsecutiveSuccesses != 8 {
-		t.Fatalf("ConsecutiveSuccesses = %d, want 8", settings.ConsecutiveSuccesses)
+	if settings.ConsecutiveSuccesses != 10 {
+		t.Fatalf("ConsecutiveSuccesses = %d, want 10", settings.ConsecutiveSuccesses)
 	}
 }
 

@@ -1097,9 +1097,8 @@ func (s *failingStorage) Put(ctx context.Context, entry *logical.StorageEntry) e
 	return s.Storage.Put(ctx, entry)
 }
 
-// The flag defaults off so enabling the feature is always a deliberate act:
-// an existing mount upgraded to this version must behave exactly as before.
-func TestServiceAccount_VerifyPropagationDefaultsOff(t *testing.T) {
+// New entries verify propagation unless the operator explicitly opts out.
+func TestServiceAccount_VerifyPropagationDefaultsOn(t *testing.T) {
 	b, storage := newTestBackend(t)
 	withStubClient(b, &stubCloudOps{})
 	mustWriteConfig(t, b, storage)
@@ -1116,21 +1115,21 @@ func TestServiceAccount_VerifyPropagationDefaultsOff(t *testing.T) {
 		t.Fatalf("read service account: err=%v resp=%v", err, resp)
 	}
 
-	if got := resp.Data["verify_propagation"]; got != false {
-		t.Fatalf("verify_propagation = %v, want false", got)
+	if got := resp.Data["verify_propagation"]; got != true {
+		t.Fatalf("verify_propagation = %v, want true", got)
 	}
 }
 
 // Same merge rule as ttl, max_ttl, and description: an update that does not
-// mention the field must not silently reset it. Without this, a write that
-// only changes ttl would turn the probe off.
+// mention the field must preserve an explicit opt-out rather than restoring
+// the default.
 func TestServiceAccount_VerifyPropagationSurvivesUnrelatedUpdate(t *testing.T) {
 	b, storage := newTestBackend(t)
 	withStubClient(b, &stubCloudOps{})
 	mustWriteConfig(t, b, storage)
 	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
 		"account_role":       "developer",
-		"verify_propagation": true,
+		"verify_propagation": false,
 	})
 	mustWriteServiceAccount(t, b, storage, "prod-workers", map[string]interface{}{
 		"account_role": "developer",
@@ -1146,8 +1145,8 @@ func TestServiceAccount_VerifyPropagationSurvivesUnrelatedUpdate(t *testing.T) {
 		t.Fatalf("read service account: err=%v resp=%v", err, resp)
 	}
 
-	if got := resp.Data["verify_propagation"]; got != true {
-		t.Fatalf("verify_propagation = %v after an unrelated update, want true", got)
+	if got := resp.Data["verify_propagation"]; got != false {
+		t.Fatalf("verify_propagation = %v after an unrelated update, want false", got)
 	}
 }
 
