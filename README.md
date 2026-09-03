@@ -36,7 +36,7 @@ You need:
 - **A Vault server** you can register external plugins on: a configured
   `plugin_directory`, and permission to run `vault plugin register`.
 - **A Temporal Cloud API key owned by a service account** with the Global Admin
-  (or Account Owner) role.
+  role.
 
 Two things about that credential are worth getting right up front, because both
 are awkward to change later:
@@ -46,6 +46,12 @@ are awkward to change later:
 > never be mixed.
 > Technically, the Temporal Cloud `CreateApiKey` api only supports service-
 > account owners, so there is no way to mint a replacement for a user identity.
+>
+> **Use Global Admin, not Account Owner.** Global Admin is the least-privileged
+> generally available Temporal role that can manage account-level service
+> accounts and their API keys. Account Owner also grants billing, payment, and
+> account-governance permissions this engine does not use. An Account Owner key
+> is accepted for compatibility, but the `config` write returns a warning.
 >
 > **Treat the root api key you paste in as disposable.** The first thing you do after
 > configuring the mount is rotate it away, which deletes it. That is the
@@ -157,21 +163,36 @@ user-owned key is rejected with a message explaining that `rotate-root` cannot
 mint a replacement for a user identity.
 
 **Nothing is stored until the credential has been proven to work.** The write
-is checked in two stages and fails at whichever comes first:
+is checked in three stages and fails at whichever comes first:
 
 1. **The key is parsed.** A Temporal Cloud API key is a JWT; the engine reads
    the key's own ID out of it. A key it cannot parse is rejected.
 2. **The key record is inspected.** The engine dials Temporal Cloud, reads the
    key by its parsed ID, and rejects it unless its owner is a service account.
    The owner ID comes from this record, not from operator input.
-3. **The owner is read.** Reading the derived service account proves the key has
-   the account-level access issuance and rotation require.
+3. **The owner is read.** Vault requires its predefined account role to be
+   Global Admin. A weaker role is rejected because it cannot manage ordinary
+   account-level service accounts and keys owned by other identities. Account
+   Owner is accepted with a warning recommending Global Admin.
 
 Only then is anything persisted. A wrong, expired, user-owned, or insufficiently
 privileged key fails at write time with a message naming the problem. None fails
 silently or waits for a later credential request. A rejected update leaves the
 previous configuration exactly as it was, so a bad write cannot break a working
 mount.
+
+> ### Future support for Temporal Custom Roles
+>
+> Temporal Custom Roles are currently pre-release. Once Temporal promotes them
+> to general availability, this plugin will support and recommend a Read-Only
+> service account augmented with an account-scoped Custom Role containing only
+> `cloud.apikey.create`, `cloud.apikey.get`, `cloud.apikey.list`,
+> `cloud.apikey.delete`, `cloud.serviceaccount.create`,
+> `cloud.serviceaccount.get`, `cloud.serviceaccount.list`,
+> `cloud.serviceaccount.update`, `cloud.serviceaccount.delete`, and
+> `cloud.asyncoperation.get`. Until that support is implemented and validated,
+> use Global Admin. Custom Roles are additive and cannot remove permissions from
+> a predefined role.
 
 ### 2. Rotate it immediately
 
@@ -487,6 +508,7 @@ cannot be shorter than 24 hours.
 | `the supplied api_key is owned by a Temporal Cloud user` | The key cannot be rotated through `CreateApiKey` | Supply a service-account-owned key |
 | `admin_service_account_id … does not own the supplied api_key` | An optional compatibility value disagrees with Temporal Cloud | Remove `admin_service_account_id` and let Vault derive it |
 | `the supplied api_key was rejected…` | Key expired, revoked, or unable to read its own record | Write `config` with a fresh service-account key |
+| `The supplied root API key belongs to an Account Owner service account` | The key works but is more privileged than necessary | Replace it with a Global Admin service-account key |
 | `The configured root API key was rejected…` on a `creds/` read | The mount's own root key has expired or been revoked | Write `config` with a fresh key, then rotate |
 | `no service account named "…" is configured` | Reading `creds/<name>` with no matching entry | Create `service-accounts/<name>` first |
 | `…has 20 of 20 permitted API keys in use` | Ceiling reached | Revoke leases, lower `ttl`, or add a service account |
@@ -540,7 +562,7 @@ deletes the old one.
 
 | Field | Description |
 | --- | --- |
-| `account_role` | **Required on every write.** One of `owner`, `admin`, `developer`, `finance-admin`, `read`, `metrics-read`. |
+| `account_role` | **Required on every write.** One of `owner`, `admin`, `developer`, `finance-admin`, `read`, `metrics-read`. Selecting `owner` returns a warning because issued credentials receive unnecessary billing and governance access. |
 | `namespace_access` | `namespace=permission` pairs (`admin`, `write`, `read`), for example `prod.acct1=write,staging.acct1=read`. |
 | `description` | Shown in the Temporal Cloud UI. Defaults to `Managed by Vault mount <mount>`. |
 | `ttl` | Default lease TTL for keys issued here. Default 1 hour. |

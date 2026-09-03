@@ -262,10 +262,12 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	}
 	cfg.AdminServiceAccountID = keyMetadata.OwnerID
 
-	// Reading the owner service account proves the key has the account-level
-	// access issuance and rotation need; inspecting its own key alone would not
-	// distinguish a restricted service account from a Global Admin.
-	if _, err := c.GetServiceAccount(ctx, cfg.AdminServiceAccountID); err != nil {
+	// Reading the owner service account lets us enforce the predefined role the
+	// plugin needs. Merely succeeding at this read is insufficient: Temporal
+	// Cloud permits weaker roles to list service accounts even though they cannot
+	// manage account-level service accounts or keys owned by other identities.
+	adminServiceAccount, err := c.GetServiceAccount(ctx, cfg.AdminServiceAccountID)
+	if err != nil {
 		switch {
 		case errors.Is(err, client.ErrNotFound):
 			return logical.ErrorResponse(
@@ -281,6 +283,29 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 		}
 	}
 
+	var resp *logical.Response
+	switch adminServiceAccount.Spec.AccountRole {
+	case "admin":
+		// Global Admin is the least-privileged predefined role that supports
+		// every operation this plugin performs.
+	case "owner":
+		resp = &logical.Response{}
+		resp.AddWarning(
+			"The supplied root API key belongs to an Account Owner service account. " +
+				"The plugin will accept it, but Global Admin is recommended because Account " +
+				"Owner also grants billing, payment, and account-governance permissions the " +
+				"plugin does not need.")
+	default:
+		role := adminServiceAccount.Spec.AccountRole
+		if role == "" {
+			role = "unknown"
+		}
+		return logical.ErrorResponse(
+			"the supplied api_key belongs to service account %q with account role %q; "+
+				"this plugin requires the Global Admin role to manage account-level service "+
+				"accounts and API keys", cfg.AdminServiceAccountID, role), nil
+	}
+
 	entry, err := logical.StorageEntryJSON(configStoragePath, cfg)
 	if err != nil {
 		return nil, err
@@ -292,7 +317,7 @@ func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *
 	// Drop any cached client so the next request picks up the new credential.
 	b.resetClient()
 
-	return nil, nil
+	return resp, nil
 }
 
 func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
@@ -351,8 +376,10 @@ const pathConfigHelp = `
 Configures how the engine reaches Temporal Cloud.
 
 The root credential must be an API key owned by a service account with the
-Global Admin or Account Owner role, because only those roles can manage service
-accounts and their API keys. It must be a service-account key rather than a user
+Global Admin role, the least-privileged predefined role that can manage
+account-level service accounts and their API keys. An Account Owner key is
+accepted for compatibility but produces a warning because it also grants
+billing, payment, and account-governance permissions this engine does not need. It must be a service-account key rather than a user
 key: Temporal Cloud's CreateApiKey supports service-account owners only, so a
 user-owned key could not be rotated by this engine.
 

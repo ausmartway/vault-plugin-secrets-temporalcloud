@@ -118,7 +118,12 @@ func TestRotateRoot_KeepsOldConfigWhenNewKeyFailsVerification(t *testing.T) {
 			if calls > 1 {
 				return nil, client.ErrPermissionDenied
 			}
-			return &client.ServiceAccount{ID: "sa-123"}, nil
+			return &client.ServiceAccount{
+				ID: "sa-123",
+				Spec: client.ServiceAccountSpec{
+					AccountRole: "admin",
+				},
+			}, nil
 		},
 	}
 	withStubClient(b, stub)

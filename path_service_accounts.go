@@ -70,8 +70,9 @@ func (b *backend) pathServiceAccounts() *framework.Path {
 				Description: "Name for this service account. Also becomes its name in Temporal Cloud.",
 			},
 			"account_role": {
-				Type:        framework.TypeString,
-				Description: "Account-level role: owner, admin, developer, finance-admin, read, or metrics-read. Required.",
+				Type: framework.TypeString,
+				Description: "Account-level role: owner, admin, developer, finance-admin, read, or metrics-read. Required. " +
+					"Using owner produces a warning because it grants full account and billing control.",
 			},
 			"namespace_access": {
 				Type:        framework.TypeCommaStringSlice,
@@ -371,6 +372,14 @@ func (b *backend) pathServiceAccountWrite(ctx context.Context, req *logical.Requ
 		return nil, fmt.Errorf("storing service account %q: %w", name, err)
 	}
 
+	if accountRole == "owner" {
+		resp := &logical.Response{}
+		resp.AddWarning(
+			"This service account has the Account Owner role. Credentials issued from it " +
+				"have full account, billing, payment, and governance access. Use Global Admin " +
+				"unless those additional permissions are explicitly required.")
+		return resp, nil
+	}
 	return nil, nil
 }
 
@@ -569,5 +578,8 @@ Read credentials for this service account from creds/<name>.
 
 Protect this path with Vault policy. An operator who can write here can create a
 service account with the owner role and then mint keys for it, so write access
-belongs only to platform operators. Applications need read on creds/<name> only.
+belongs only to platform operators. Selecting owner returns a warning because
+those credentials gain full billing, payment, and account-governance access;
+use admin unless that additional authority is explicitly required. Applications
+need read on creds/<name> only.
 `

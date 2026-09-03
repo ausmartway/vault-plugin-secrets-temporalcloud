@@ -41,7 +41,12 @@ func (s *stubCloudOps) GetServiceAccount(ctx context.Context, id string) (*clien
 	if s.getServiceAccountFn != nil {
 		return s.getServiceAccountFn(ctx, id)
 	}
-	return &client.ServiceAccount{ID: id}, nil
+	return &client.ServiceAccount{
+		ID: id,
+		Spec: client.ServiceAccountSpec{
+			AccountRole: "admin",
+		},
+	}, nil
 }
 
 func (s *stubCloudOps) UpdateServiceAccount(ctx context.Context, id string, spec client.ServiceAccountSpec) error {
@@ -546,7 +551,12 @@ func TestConfig_DerivesServiceAccountOwner(t *testing.T) {
 			if id != "sa-derived" {
 				t.Fatalf("validated service account %q, want derived owner", id)
 			}
-			return &client.ServiceAccount{ID: id}, nil
+			return &client.ServiceAccount{
+				ID: id,
+				Spec: client.ServiceAccountSpec{
+					AccountRole: "admin",
+				},
+			}, nil
 		},
 	}
 	withStubClient(b, stub)
@@ -567,6 +577,67 @@ func TestConfig_DerivesServiceAccountOwner(t *testing.T) {
 	}
 	if cfg.AdminServiceAccountID != "sa-derived" {
 		t.Fatalf("admin service account = %q, want sa-derived", cfg.AdminServiceAccountID)
+	}
+}
+
+func TestConfig_AcceptsAccountOwnerWithWarning(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{
+		getServiceAccountFn: func(_ context.Context, id string) (*client.ServiceAccount, error) {
+			return &client.ServiceAccount{
+				ID: id,
+				Spec: client.ServiceAccountSpec{
+					AccountRole: "owner",
+				},
+			}, nil
+		},
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data:      map[string]interface{}{"api_key": testAPIKey("key-owner")},
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("write Account Owner config: err=%v resp=%v", err, resp)
+	}
+	if len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], "Global Admin is recommended") {
+		t.Fatalf("warnings = %v, want Global Admin recommendation", resp.Warnings)
+	}
+	if cfg, err := b.getConfig(context.Background(), storage); err != nil || cfg == nil {
+		t.Fatalf("Account Owner config was not stored: cfg=%v err=%v", cfg, err)
+	}
+}
+
+func TestConfig_RejectsInsufficientAccountRole(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{
+		getServiceAccountFn: func(_ context.Context, id string) (*client.ServiceAccount, error) {
+			return &client.ServiceAccount{
+				ID: id,
+				Spec: client.ServiceAccountSpec{
+					AccountRole: "read",
+				},
+			}, nil
+		},
+	})
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "config",
+		Storage:   storage,
+		Data:      map[string]interface{}{"api_key": testAPIKey("key-read")},
+	})
+	if err != nil || resp == nil || !resp.IsError() {
+		t.Fatalf("expected Read-Only root rejection: err=%v resp=%v", err, resp)
+	}
+	msg := resp.Error().Error()
+	if !strings.Contains(msg, `account role "read"`) || !strings.Contains(msg, "requires the Global Admin role") {
+		t.Fatalf("unclear role error: %s", msg)
+	}
+	if entry, _ := storage.Get(context.Background(), configStoragePath); entry != nil {
+		t.Fatal("insufficiently privileged root key must not be stored")
 	}
 }
 

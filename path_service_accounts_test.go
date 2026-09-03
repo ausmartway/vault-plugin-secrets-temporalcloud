@@ -95,6 +95,25 @@ func TestParseNamespaceAccess(t *testing.T) {
 	}
 }
 
+func TestServiceAccounts_AccountOwnerProducesWarning(t *testing.T) {
+	b, storage := newTestBackend(t)
+	withStubClient(b, &stubCloudOps{})
+	mustWriteConfig(t, b, storage)
+
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.CreateOperation,
+		Path:      "service-accounts/owner-credential",
+		Storage:   storage,
+		Data:      map[string]interface{}{"account_role": "owner"},
+	})
+	if err != nil || resp == nil || resp.IsError() {
+		t.Fatalf("create Account Owner service account: err=%v resp=%v", err, resp)
+	}
+	if len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], "Use Global Admin") {
+		t.Fatalf("warnings = %v, want Global Admin recommendation", resp.Warnings)
+	}
+}
+
 func TestServiceAccounts_CreateReadDelete(t *testing.T) {
 	b, storage := newTestBackend(t)
 

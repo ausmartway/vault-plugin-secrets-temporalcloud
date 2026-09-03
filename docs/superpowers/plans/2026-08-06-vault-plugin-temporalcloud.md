@@ -15,6 +15,13 @@
 > keys, and derives the service-account owner ID. The field remains only as an
 > optional compatibility check. Original steps below are retained as history
 > and are superseded where they require the owner ID.
+>
+> **Implemented root-permissions amendment:** Global Admin is the recommended
+> and least-privileged generally available predefined root role. Account Owner
+> remains accepted but returns a warning; weaker predefined roles are rejected.
+> When Temporal Custom Roles become generally available, the plugin will support
+> and recommend a Read-Only identity plus only its required account-scoped API
+> actions. Older Global Admin-or-Owner statements below remain as history.
 
 ## Global Constraints
 

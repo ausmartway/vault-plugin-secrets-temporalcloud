@@ -8,6 +8,14 @@
 > and stores the service-account owner ID Temporal Cloud reports. The field is
 > retained only as an optional compatibility check. Statements below that the
 > API cannot report ownership are superseded by this behavior.
+>
+> **Root-permissions amendment:** The recommended predefined role for the root
+> service account is Global Admin. Account Owner is accepted but warns because
+> its billing, payment, and account-governance permissions are unnecessary;
+> weaker predefined roles are rejected. Temporal Custom Roles are pre-release.
+> Once generally available, the plugin will support and recommend Read-Only plus
+> the account-scoped API-key, service-account, and async-operation actions it
+> uses.
 
 ## Problem
 
